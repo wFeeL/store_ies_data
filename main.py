@@ -1,11 +1,35 @@
 import csv
-import glob
 import json
 import os
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import ips
+
+GAME_TICKS = 100
+FORECAST_DIR = os.path.expanduser('~/ips3-sandbox')
+DEFAULT_FORECAST_FILE = os.path.join(FORECAST_DIR, 'forecast.csv')
+
+MARKET_INSIGHTS = {
+    'good_fill_ratio': 0.88,
+    'weak_fill_ratio': 0.72,
+    'bad_fill_ratio': 0.58,
+    'preferred_ask_low': 2.8,
+    'preferred_ask_high': 5.0,
+    'overpriced_ask': 7.2,
+}
+
+# Softened empirical priors: still keep relative ordering from archive games,
+# but stay closer to neutral because object estimates are not yet fully trusted.
+PRODUCER_INSIGHTS = {
+    's1': {'strength': 1.00, 'stability': 0.66, 'storm_risk': 0.00},
+    's7': {'strength': 1.02, 'stability': 0.64, 'storm_risk': 0.00},
+    's8': {'strength': 0.95, 'stability': 0.64, 'storm_risk': 0.00},
+    'a3': {'strength': 0.96, 'stability': 0.66, 'storm_risk': 0.16},
+    'a5': {'strength': 1.00, 'stability': 0.61, 'storm_risk': 0.38},
+    'a6': {'strength': 0.98, 'stability': 0.63, 'storm_risk': 0.24},
+    'a8': {'strength': 0.97, 'stability': 0.62, 'storm_risk': 0.22},
+}
 
 STATE_FILE = os.path.expanduser('~/ips3-sandbox/ies_state.json')
 LOG_DIR = os.path.expanduser('~/ips3-sandbox/ies_logs')
@@ -20,22 +44,41 @@ OBJECT_PREDICTIONS_CSV = os.path.join(LOG_DIR, 'object_predictions.csv')
 
 MIN_ORDER_VOLUME = 0.25
 MIN_RESERVE = 0.8
+MARKET_PRICE_MIN = 2.0
+MARKET_PRICE_MAX = 20.0
 SOC_FLOOR_FRAC = 0.06
 SOC_CEIL_FRAC = 0.95
 ENDGAME_TICKS = 5
-LOOKAHEAD = 6
+LOOKAHEAD = max(8, GAME_TICKS // 12)
+MARKET_HISTORY_WINDOW = 8
 STRICT_FIRST_TICK_CAP = True
 
 SOLAR_SEED_FACTORS = {
     's1': 0.50,
-    's7': 0.77,
-    's8': 0.86,
+    's7': 0.62,
+    's8': 0.47,
 }
 WIND_SEED_FACTORS = {
-    'a6': 0.0054,
+    'a3': 0.0046,
+    'a5': 0.0050,
+    'a6': 0.0048,
     'a8': 0.0047,
 }
-LOAD_BIAS_PRIOR = 0.82
+LOAD_BIAS_PRIOR = 0.60
+LOAD_TYPE_BIAS_PRIORS = {
+    'factory': 0.48,
+    'houseA': 0.46,
+    'houseB': 0.52,
+    'office': 0.57,
+    'hospital': 0.62,
+}
+LOAD_TYPE_BIAS_BOUNDS = {
+    'factory': (0.26, 1.18),
+    'houseA': (0.24, 1.18),
+    'houseB': (0.26, 1.14),
+    'office': (0.28, 1.18),
+    'hospital': (0.36, 1.22),
+}
 LOSS_MODEL_PRIOR = {
     'gen_quad': 0.0058,
     'gen_lin': 0.2120,
@@ -84,6 +127,41 @@ FORECAST_HEADER_TO_KEY = {
 }
 FORECAST_SERIES_ORDER = ('hospital', 'factory', 'office', 'houseA', 'houseB', 'sun', 'wind')
 _FORECAST_CACHE: Dict[str, Any] = {'key': None, 'payload': None}
+OBJECTS_FIELDNAMES = [
+    'tick', 'id', 'type', 'contract', 'address', 'path',
+    'generated', 'consumed', 'income', 'loss', 'charge_now', 'wind_rotation', 'failed',
+    'cum_generated', 'cum_consumed', 'cum_income', 'cum_loss', 'cum_ticks',
+]
+NETWORKS_FIELDNAMES = ['tick', 'network_index', 'location', 'upflow', 'downflow', 'losses']
+EXCHANGE_FIELDNAMES = [
+    'tick', 'receipt_index', 'side', 'askedAmount', 'askedPrice', 'contractedAmount', 'contractedPrice', 'instantAmount',
+    'abs_askedAmount', 'abs_contractedAmount', 'abs_instantAmount',
+]
+FORECAST_ERRORS_FIELDNAMES = ['tick', 'metric', 'forecast', 'actual', 'error', 'abs_error']
+DERIVED_METRICS_FIELDNAMES = [
+    'tick', 'sun_now', 'wind_now', 'forecast_source', 'forecast_rows',
+    'profile_current', 'profile_next_mixed_in', 'profile_next_risk_in',
+    'solar_actual', 'wind_actual', 'gross_actual',
+    'solar_theoretical_now', 'wind_theoretical_now', 'gross_theoretical_now',
+    'load_forecast_now', 'load_actual_now', 'useful_energy_now',
+    'physical_balance_now', 'marketable_useful_now', 'losses_now',
+    'buy_asked', 'buy_contracted', 'buy_instant', 'buy_avg_asked_price', 'buy_avg_contracted_price',
+    'sell_asked', 'sell_contracted', 'sell_instant', 'sell_avg_asked_price', 'sell_avg_contracted_price',
+    'storage_soc_total', 'storage_target_soc', 'storage_prep_soc', 'storage_emergency_floor_soc',
+    'storage_working_floor_soc', 'storage_high_risk_target_soc',
+    'storage_charge_total', 'storage_discharge_total', 'storage_discharge_for_market',
+    'offer_cap', 'reserve', 'sell_volume', 'market_price_realism', 'market_overpriced',
+    'topology_warning_count', 'topology_branch_concentration', 'topology_loss_share_est', 'topology_vulnerabilities',
+    'forecast_profile_context',
+    'cum_solar_actual', 'cum_wind_actual', 'cum_gross_actual', 'cum_load_actual',
+    'cum_losses', 'cum_useful_energy', 'cum_buy_asked', 'cum_buy_contracted', 'cum_sell_asked', 'cum_sell_contracted',
+]
+OBJECT_PREDICTIONS_FIELDNAMES = [
+    'tick', 'address', 'type',
+    'gen_actual', 'gen_theoretical_now', 'gen_model_error',
+    'load_actual', 'load_forecast_now', 'load_model_now', 'load_model_error',
+    'sun_now', 'wind_now',
+]
 
 
 # =====================
@@ -100,18 +178,18 @@ def round_vol(x: float) -> float:
 
 def round_price(x: float, price_max: float = 20.0, price_step: float = 0.2) -> float:
     step = max(0.01, float(price_step))
-    hi = max(2.0, float(price_max))
-    x = clamp(float(x), 2.0, hi)
+    hi = clamp(float(price_max), MARKET_PRICE_MIN, MARKET_PRICE_MAX)
+    x = clamp(float(x), MARKET_PRICE_MIN, hi)
     return round(round(x / step) * step, 2)
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:
-            return float(default)
+            return None if default is None else float(default)
         return float(value)
     except Exception:
-        return float(default)
+        return None if default is None else float(default)
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -121,6 +199,12 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return int(default)
+
+
+def avg(values: List[float], default: float = 0.0) -> float:
+    if not values:
+        return float(default)
+    return sum(float(v) for v in values) / float(len(values))
 
 
 def addr_to_str(address: Any) -> str:
@@ -158,6 +242,21 @@ def append_csv(path: str, fieldnames: List[str], row: Dict[str, Any]) -> None:
         pass
 
 
+def csv_scalar(value: Any) -> Any:
+    if value is None:
+        return ''
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+    return value
+
+
+def make_csv_row(fieldnames: List[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    return {name: csv_scalar(row.get(name, '')) for name in fieldnames}
+
+
 def reset_runtime_outputs() -> None:
     ensure_dir(LOG_DIR)
     for path in [
@@ -185,12 +284,6 @@ def normalize_forecast_header(name: Any) -> str:
     s = str(name or '').strip().lower().replace('ё', 'е').replace('_', ' ').replace('-', ' ')
     s = ' '.join(s.split())
     return FORECAST_HEADER_TO_KEY.get(s, '')
-
-
-def _forecast_file_rank(path: str) -> Tuple[int, int, float]:
-    name = os.path.basename(path).lower()
-    forecast_like = int('forecast' in name)
-    return (forecast_like, int(name.startswith('forecast')), os.path.getmtime(path))
 
 
 def _parse_forecast_csv(path: str) -> Optional[Dict[str, Any]]:
@@ -234,40 +327,24 @@ def _parse_forecast_csv(path: str) -> Optional[Dict[str, Any]]:
 
 
 def find_external_forecast_file() -> Optional[str]:
-    env_path = os.environ.get('IES_FORECAST_FILE')
-    if env_path:
-        path = os.path.abspath(os.path.expanduser(env_path))
-        return path if _parse_forecast_csv(path) is not None else None
-
-    candidates: List[str] = []
-    search_roots = [
-        os.getcwd(),
-        os.path.expanduser('~/ips3-sandbox'),
-        os.path.dirname(os.path.abspath(__file__)),
-        '/mnt/data',
-    ]
-    seen = set()
-    for root in search_roots:
-        if not root or root in seen or not os.path.isdir(root):
-            continue
-        seen.add(root)
-        candidates.extend(sorted(glob.glob(os.path.join(root, 'forecast*.csv'))))
-        # broader scan but only validated forecast files will pass
-        candidates.extend(sorted(glob.glob(os.path.join(root, '*.csv'))))
-
-    unique_candidates: List[str] = []
-    seen_paths = set()
-    for p in candidates:
-        ap = os.path.abspath(p)
-        if ap in seen_paths or not os.path.isfile(ap):
-            continue
-        seen_paths.add(ap)
-        unique_candidates.append(ap)
-
-    unique_candidates.sort(key=_forecast_file_rank, reverse=True)
-    for path in unique_candidates:
+    preferred = [DEFAULT_FORECAST_FILE]
+    for path in preferred:
+        path = os.path.abspath(os.path.expanduser(path))
         if _parse_forecast_csv(path) is not None:
             return path
+    try:
+        candidates = []
+        for entry in os.scandir(FORECAST_DIR):
+            if not entry.is_file():
+                continue
+            if not entry.name.lower().startswith('forecast') or not entry.name.lower().endswith('.csv'):
+                continue
+            candidates.append((entry.stat().st_mtime_ns, entry.path))
+        for _, path in sorted(candidates, reverse=True):
+            if _parse_forecast_csv(path) is not None:
+                return path
+    except Exception:
+        return None
     return None
 
 
@@ -306,8 +383,10 @@ def get_tick(psm: Any) -> int:
 
 def get_game_length(psm: Any) -> int:
     if isinstance(psm, dict):
-        return safe_int(psm.get('gameLength', 100), 100)
-    return safe_int(getattr(psm, 'gameLength', 100), 100)
+        value = safe_int(psm.get('gameLength', GAME_TICKS), GAME_TICKS)
+    else:
+        value = safe_int(getattr(psm, 'gameLength', GAME_TICKS), GAME_TICKS)
+    return value if value > 0 else GAME_TICKS
 
 
 def get_score_breakdown(psm: Any) -> Tuple[float, float, Optional[float]]:
@@ -359,16 +438,14 @@ def get_weather_now(psm: Any, name: str) -> float:
 
 
 def get_forecast_bundle(psm: Any) -> Dict[str, Dict[str, Any]]:
-    # Prefer explicit env override, else real psm.forecasts if available, else external CSV fallback.
-    env_path = os.environ.get('IES_FORECAST_FILE')
-    if env_path:
-        ext = load_external_forecast_csv()
-        if ext:
-            out: Dict[str, Dict[str, Any]] = {}
-            for name, item in ext['bundle'].items():
-                out[name] = {'data': list(item.get('data', [])), 'spread': safe_float(item.get('spread', 0.0), 0.0), 'source': 'csv'}
-            out['_meta'] = {'source': 'csv', 'path': ext['path'], 'rows': ext['rows']}
-            return out
+    # Active runtime forecast is the sandbox CSV when it exists.
+    ext = load_external_forecast_csv()
+    if ext:
+        out: Dict[str, Dict[str, Any]] = {}
+        for name, item in ext['bundle'].items():
+            out[name] = {'data': list(item.get('data', [])), 'spread': safe_float(item.get('spread', 0.0), 0.0), 'source': 'csv'}
+        out['_meta'] = {'source': 'csv', 'path': ext['path'], 'rows': ext['rows']}
+        return out
 
     raw = psm.get('forecasts') if isinstance(psm, dict) else getattr(psm, 'forecasts', None)
     out: Dict[str, Dict[str, Any]] = {}
@@ -394,14 +471,6 @@ def get_forecast_bundle(psm: Any) -> Dict[str, Dict[str, Any]]:
     psm_rows = max((len(v.get('data', [])) for v in out.values() if isinstance(v, dict) and 'data' in v), default=0)
     if psm_rows > 0:
         out['_meta'] = {'source': 'psm', 'path': None, 'rows': psm_rows}
-        return out
-
-    ext = load_external_forecast_csv()
-    if ext:
-        out = {}
-        for name, item in ext['bundle'].items():
-            out[name] = {'data': list(item.get('data', [])), 'spread': safe_float(item.get('spread', 0.0), 0.0), 'source': 'csv'}
-        out['_meta'] = {'source': 'csv', 'path': ext['path'], 'rows': ext['rows']}
         return out
 
     out['_meta'] = {'source': 'psm', 'path': None, 'rows': 0}
@@ -587,14 +656,18 @@ def exchange_receipt_data(receipt: Any) -> Dict[str, float]:
 def default_state() -> Dict[str, Any]:
     return {
         'prev_useful_supply_est': None,
+        'prev_useful_energy_actual': None,
         'last_sell_volume': 0.0,
         'abs_err_ewma': 1.2,
         'loss_ratio_ewma': 0.18,
         'fill_ratio_ewma': 0.74,
         'market_ref': 4.8,
+        'market_history': [],
         'load_bias_total': LOAD_BIAS_PRIOR,
         'load_abs_err': 2.0,
+        'load_mix': {'counts': {}, 'houseb_share': 0.0},
         'object_models': {},
+        'forecast_profile': None,
         'weather_history': {'wind': [], 'sun': []},
         'loss_model': dict(LOSS_MODEL_PRIOR, scale=1.0),
         'object_cum': {},
@@ -644,12 +717,16 @@ def get_model(state: Dict[str, Any], key: str, kind: str) -> Dict[str, Any]:
     mkey = _model_key(key, kind)
     if mkey not in models:
         if kind == 'solar':
+            prior = PRODUCER_INSIGHTS.get(key, {})
             models[mkey] = {
                 'kind': kind,
                 'factor': SOLAR_SEED_FACTORS.get(key, 0.65),
                 'err': 0.8,
+                'samples': 0,
+                'strength_bias': safe_float(prior.get('strength', 1.0), 1.0),
             }
         elif kind == 'wind':
+            prior = PRODUCER_INSIGHTS.get(key, {})
             models[mkey] = {
                 'kind': kind,
                 'factor': WIND_SEED_FACTORS.get(key, 0.0050),
@@ -659,9 +736,12 @@ def get_model(state: Dict[str, Any], key: str, kind: str) -> Dict[str, Any]:
                 'max_power_seen': 0.0,
                 'err': 2.5,
                 'last_failed': 0,
+                'samples': 0,
+                'storm_risk': safe_float(prior.get('storm_risk', 0.0), 0.0),
+                'strength_bias': safe_float(prior.get('strength', 1.0), 1.0),
             }
         else:
-            models[mkey] = {'kind': kind, 'bias': 1.0, 'err': 0.6}
+            models[mkey] = {'kind': kind, 'bias': None, 'err': 0.6, 'samples': 0}
     return models[mkey]
 
 
@@ -860,14 +940,38 @@ def update_forecast_error_log(tick: int, state: Dict[str, Any], object_rows: Lis
     }
     for name, fc in current_fc.items():
         actual = actuals.get(name, 0.0)
-        append_csv(FORECAST_ERRORS_CSV, ['tick', 'metric', 'forecast', 'actual', 'error', 'abs_error'], {
+        append_csv(FORECAST_ERRORS_CSV, FORECAST_ERRORS_FIELDNAMES, make_csv_row(FORECAST_ERRORS_FIELDNAMES, {
             'tick': tick,
             'metric': name,
             'forecast': round(fc, 6),
             'actual': round(actual, 6),
             'error': round(actual - fc, 6),
             'abs_error': round(abs(actual - fc), 6),
-        })
+        }))
+
+
+def get_type_load_prior(state: Dict[str, Any], obj_type: str) -> float:
+    prior = safe_float(LOAD_TYPE_BIAS_PRIORS.get(obj_type, LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR)
+    mix = state.get('load_mix', {})
+    houseb_share = safe_float(mix.get('houseb_share', 0.0), 0.0)
+    if obj_type == 'houseB' and houseb_share > 0.25:
+        damp = clamp(1.0 - 0.55 * (houseb_share - 0.25), 0.74, 1.0)
+        prior *= damp
+    return clamp(prior, 0.20, 1.20)
+
+
+def get_type_load_bounds(state: Dict[str, Any], obj_type: str) -> Tuple[float, float]:
+    lo, hi = LOAD_TYPE_BIAS_BOUNDS.get(obj_type, (0.20, 1.20))
+    mix = state.get('load_mix', {})
+    houseb_share = safe_float(mix.get('houseb_share', 0.0), 0.0)
+    if obj_type == 'houseB' and houseb_share > 0.25:
+        over = clamp((houseb_share - 0.25) / 0.35, 0.0, 1.0)
+        hi = min(hi, 1.12 - 0.08 * over)
+    return clamp(lo, 0.10, 2.00), clamp(max(lo, hi), lo, 2.00)
+
+
+def clamp_storage_soc(value: Any, cell_capacity: float) -> float:
+    return clamp(safe_float(value, 0.0), 0.0, max(0.0, cell_capacity))
 
 
 def update_models(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weather: Dict[str, float], bundle: Dict[str, Dict[str, Any]], tick: int, cfg: Optional[Dict[str, Any]] = None, total_consumed: Optional[float] = None, total_losses: Optional[float] = None) -> None:
@@ -876,11 +980,18 @@ def update_models(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weat
     hist = state.setdefault('weather_history', {'wind': [], 'sun': []})
     hist['wind'] = (hist.get('wind') or [])[-12:] + [wind_now]
     hist['sun'] = (hist.get('sun') or [])[-12:] + [sun_now]
+    load_counts = count_forecast_objects(object_rows)
+    total_load_objects = max(1, sum(load_counts.values()))
+    state['load_mix'] = {
+        'counts': load_counts,
+        'total_objects': total_load_objects,
+        'houseb_share': load_counts.get('houseB', 0) / float(total_load_objects),
+    }
 
     total_fc_now = aggregate_forecast_load(bundle, object_rows, tick)
     if total_consumed is not None and total_fc_now > 1e-6:
         load_bias = total_consumed / max(total_fc_now, 1e-6)
-        load_bias = clamp(load_bias, 0.68, 1.10)
+        load_bias = clamp(load_bias, 0.28, 1.10)
         state['load_bias_total'] = 0.90 * safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) + 0.10 * load_bias
         pred_total = safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) * total_fc_now
         state['load_abs_err'] = 0.90 * safe_float(state.get('load_abs_err', 2.0), 2.0) + 0.10 * abs(total_consumed - pred_total)
@@ -903,6 +1014,7 @@ def update_models(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weat
                 model['factor'] = 0.90 * safe_float(model.get('factor', 0.65), 0.65) + 0.10 * clamp(est, 0.0, 1.6)
             pred = safe_float(model.get('factor', 0.65), 0.65) * sun_now
             model['err'] = 0.88 * safe_float(model.get('err', 0.8), 0.8) + 0.12 * abs(actual - pred)
+            model['samples'] = safe_int(model.get('samples', 0), 0) + 1
         elif typ == 'wind':
             model = get_model(state, key, 'wind')
             actual = row['generated']
@@ -931,19 +1043,24 @@ def update_models(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weat
                 pred *= 0.86
             model['err'] = 0.90 * safe_float(model.get('err', 2.5), 2.5) + 0.10 * abs(actual - pred)
             model['last_failed'] = failed_now
+            model['samples'] = safe_int(model.get('samples', 0), 0) + 1
         elif typ in OBJECT_TYPE_TO_FORECAST:
             model = get_model(state, key, 'load')
             actual = row['consumed']
             fc_name = OBJECT_TYPE_TO_FORECAST.get(typ)
             fc_now = get_forecast_value(bundle, fc_name, tick)
-            base_bias = safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR)
+            type_prior = get_type_load_prior(state, typ)
+            base_bias = 0.55 * safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) + 0.45 * type_prior
+            lo, hi = get_type_load_bounds(state, typ)
+            model_bias = safe_float(model.get('bias', base_bias), base_bias)
             if fc_now > 0.05 and actual >= 0.0:
                 est_bias = actual / max(fc_now, 1e-6)
-                model['bias'] = 0.94 * safe_float(model.get('bias', base_bias), base_bias) + 0.06 * clamp(est_bias, 0.55, 1.20)
+                model['bias'] = 0.92 * model_bias + 0.08 * clamp(est_bias, lo, hi)
             else:
-                model['bias'] = 0.98 * safe_float(model.get('bias', base_bias), base_bias) + 0.02 * base_bias
-            pred = safe_float(model.get('bias', base_bias), base_bias) * max(fc_now, 0.0)
+                model['bias'] = 0.97 * model_bias + 0.03 * base_bias
+            pred = clamp(safe_float(model.get('bias', base_bias), base_bias), lo, hi) * max(fc_now, 0.0)
             model['err'] = 0.92 * safe_float(model.get('err', 0.6), 0.6) + 0.08 * abs(actual - pred)
+            model['samples'] = safe_int(model.get('samples', 0), 0) + 1
 
 
 def analyze_exchange(exchange_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -988,6 +1105,50 @@ def analyze_exchange(exchange_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def update_market_history(state: Dict[str, Any], tick: int, market_stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+    history = list(state.get('market_history', []))
+    history.append({
+        'tick': tick,
+        'sell_asked': safe_float(market_stats.get('sell_asked', 0.0), 0.0),
+        'sell_contracted': safe_float(market_stats.get('sell_contracted', 0.0), 0.0),
+        'fill_ratio': safe_float(market_stats.get('sell_fill_ratio', 0.0), 0.0),
+        'avg_ask_price': safe_float(market_stats.get('sell_avg_asked_price', 0.0), 0.0),
+        'avg_contracted_price': safe_float(market_stats.get('sell_avg_contracted_price', 0.0), 0.0),
+    })
+    history = history[-MARKET_HISTORY_WINDOW:]
+    state['market_history'] = history
+    return history
+
+
+def build_market_context(state: Dict[str, Any], market_stats: Dict[str, Any]) -> Dict[str, Any]:
+    history = list(state.get('market_history', []))
+    fill_samples = [safe_float(row.get('fill_ratio', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > 0.25]
+    ask_samples = [safe_float(row.get('avg_ask_price', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > 0.25]
+    recent_fill = avg(fill_samples, default=safe_float(state.get('fill_ratio_ewma', 0.74), 0.74))
+    recent_ask = avg(ask_samples, default=safe_float(state.get('market_ref', 4.8), 4.8))
+    weak_fill_ratio = safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78)
+    good_fill_ratio = safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.92), 0.92)
+    overpriced_ask = safe_float(MARKET_INSIGHTS.get('overpriced_ask', 6.2), 6.2)
+    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 4.6), 4.6)
+    price_realism = 1.0
+    if recent_ask > preferred_ask_high:
+        over = recent_ask - preferred_ask_high
+        span = max(0.8, overpriced_ask - preferred_ask_high)
+        price_realism = clamp(1.0 - over / span, 0.18, 1.0)
+    if recent_fill < weak_fill_ratio:
+        price_realism *= clamp(0.65 + 0.55 * recent_fill / max(weak_fill_ratio, 1e-6), 0.22, 1.0)
+    overpriced = recent_ask >= overpriced_ask and recent_fill < weak_fill_ratio
+    return {
+        'history': history,
+        'recent_fill_ratio': recent_fill,
+        'recent_ask_price': recent_ask,
+        'price_realism': price_realism,
+        'good_fill': recent_fill >= good_fill_ratio,
+        'weak_fill': recent_fill < weak_fill_ratio,
+        'overpriced': overpriced,
+    }
+
+
 def compute_useful_energy(total_generated: float, total_consumed: float, total_losses: float) -> float:
     return total_generated - total_losses
 
@@ -997,7 +1158,7 @@ def compute_balance_energy(total_generated: float, total_consumed: float, total_
 
 
 def compute_offer_cap(state: Dict[str, Any], cfg: Dict[str, Any], tick: int, useful_supply_now: float) -> float:
-    prev_useful = state.get('prev_useful_supply_est')
+    prev_useful = state.get('prev_useful_energy_actual')
     if prev_useful is None:
         if tick == 0 and STRICT_FIRST_TICK_CAP:
             return safe_float(cfg['exchangeAmountBuffer'], 10.0)
@@ -1017,6 +1178,7 @@ def predict_object_generation(state: Dict[str, Any], row: Dict[str, Any], fc_sun
         current_sun = max(0.0, safe_float(weather.get('sun', 0.0), 0.0))
         eff_sun = max(0.0, (1.0 - blend) * current_sun + blend * max(0.0, fc_sun - 0.20 * sun_spread))
         pred = safe_float(model.get('factor', 0.65), 0.65) * eff_sun
+        pred *= clamp(safe_float(model.get('strength_bias', 1.0), 1.0), 0.75, 1.08)
         pred *= clamp(1.0 - 0.03 * safe_float(model.get('err', 0.8), 0.8), 0.82, 1.00)
         return clamp(pred, 0.0, safe_float(cfg.get('maxSolarPower', 20.0), 20.0))
     if typ == 'wind':
@@ -1038,14 +1200,17 @@ def predict_object_generation(state: Dict[str, Any], row: Dict[str, Any], fc_sun
         max_seen = safe_float(model.get('max_power_seen', 0.0), 0.0)
         if max_seen > 0.0:
             pred = min(pred, min(max_wind_power, 1.10 * max_seen + 0.4))
+        pred *= clamp(safe_float(model.get('strength_bias', 1.0), 1.0), 0.72, 1.10)
         pred *= clamp(1.0 - 0.05 * safe_float(model.get('err', 2.5), 2.5), 0.70, 1.00)
         failed_now = safe_int(row.get('failed', 0), 0)
         if failed_now > 0:
             pred *= 0.60
         elif safe_int(model.get('last_failed', 0), 0) > 0:
             pred *= 0.82
-        if eff_wind > safe_float(cfg.get('weatherMaxWind', 15.0), 15.0) * 0.85:
-            pred *= 0.90
+        wind_limit = safe_float(cfg.get('weatherMaxWind', 15.0), 15.0)
+        storm_risk = safe_float(model.get('storm_risk', 0.0), 0.0)
+        if eff_wind > wind_limit * 0.85:
+            pred *= clamp(0.92 - 0.12 * storm_risk, 0.72, 0.94)
         return clamp(pred, 0.0, max_wind_power)
     return 0.0
 
@@ -1056,9 +1221,19 @@ def predict_object_load(state: Dict[str, Any], row: Dict[str, Any], forecast_val
     if typ not in OBJECT_TYPE_TO_FORECAST:
         return 0.0
     model = get_model(state, key, 'load')
-    base_bias = safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR)
-    bias = 0.35 * safe_float(model.get('bias', base_bias), base_bias) + 0.65 * base_bias
-    return max(0.0, forecast_value * bias)
+    type_prior = get_type_load_prior(state, typ)
+    lo, hi = get_type_load_bounds(state, typ)
+    base_bias = 0.55 * safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) + 0.45 * type_prior
+    model_bias = safe_float(model.get('bias', base_bias), base_bias)
+    model_bias = clamp(model_bias, lo, hi)
+    samples = safe_int(model.get('samples', 0), 0)
+    trust = clamp(0.10 + 0.08 * samples, 0.14, 0.72)
+    if typ == 'houseB' and safe_float(state.get('load_mix', {}).get('houseb_share', 0.0), 0.0) > 0.35:
+        trust = min(trust, 0.48)
+    if model.get('bias') is None:
+        trust = min(trust, 0.18)
+    bias = trust * model_bias + (1.0 - trust) * base_bias
+    return max(0.0, forecast_value * clamp(bias, lo, hi))
 
 
 def forecast_window(state: Dict[str, Any], object_rows: List[Dict[str, Any]], bundle: Dict[str, Dict[str, Any]], tick: int, game_length: int, horizon: int) -> List[Dict[str, Any]]:
@@ -1133,13 +1308,171 @@ def update_cumulative_state(state: Dict[str, Any], obj_agg: Dict[str, Any], obje
     return cumulative
 
 
-def compute_target_soc(cfg: Dict[str, Any], total_capacity: float, total_soc: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10) -> float:
-    base_ceil = total_capacity * SOC_CEIL_FRAC
+def percentile(values: List[float], q: float) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(float(v) for v in values)
+    if len(vals) == 1:
+        return vals[0]
+    q = clamp(float(q), 0.0, 1.0)
+    pos = q * (len(vals) - 1)
+    lo = int(pos)
+    hi = min(len(vals) - 1, lo + 1)
+    frac = pos - lo
+    return vals[lo] * (1.0 - frac) + vals[hi] * frac
+
+
+def contiguous_windows(flags: List[bool], min_len: int = 1) -> List[Tuple[int, int]]:
+    out: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for i, flag in enumerate(flags):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            if i - start >= min_len:
+                out.append((start, i - 1))
+            start = None
+    if start is not None and len(flags) - start >= min_len:
+        out.append((start, len(flags) - 1))
+    return out
+
+
+def build_forecast_profile(bundle: Dict[str, Dict[str, Any]], object_rows: List[Dict[str, Any]], game_length: int) -> Dict[str, Any]:
+    rows = min(game_length, safe_int(bundle.get('_meta', {}).get('rows', game_length), game_length))
+    if rows <= 0:
+        return {'rows': 0, 'ticks': [], 'windows': {}}
+    sun = [get_forecast_value(bundle, 'sun', t) for t in range(rows)]
+    wind = [get_forecast_value(bundle, 'wind', t) for t in range(rows)]
+    load = [aggregate_forecast_load(bundle, object_rows, t) for t in range(rows)]
+
+    def _stats(vals: List[float]) -> Tuple[float, float]:
+        if not vals:
+            return 0.0, 1.0
+        mean = sum(vals) / max(1, len(vals))
+        var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals))
+        return mean, max(var ** 0.5, 1e-6)
+
+    sun_mean, sun_std = _stats(sun)
+    wind_mean, wind_std = _stats(wind)
+    load_mean, load_std = _stats(load)
+    sun_q55 = percentile(sun, 0.55)
+    sun_q70 = percentile(sun, 0.70)
+    wind_q30 = percentile(wind, 0.30)
+    wind_q70 = percentile(wind, 0.70)
+    load_q70 = percentile(load, 0.70)
+    load_q85 = percentile(load, 0.85)
+
+    ticks: List[Dict[str, Any]] = []
+    for t in range(rows):
+        z_sun = (sun[t] - sun_mean) / sun_std
+        z_wind = (wind[t] - wind_mean) / wind_std
+        z_load = (load[t] - load_mean) / load_std
+        solar_active = sun[t] >= max(1.0, sun_q55)
+        solar_peak = sun[t] >= max(2.0, sun_q70)
+        load_peak = load[t] >= load_q70
+        load_extreme = load[t] >= load_q85
+        wind_peak = wind[t] >= wind_q70
+        wind_low = wind[t] <= wind_q30
+        mixed_peak = solar_peak and load_peak
+        combo_score = 0.52 * z_sun + 0.33 * z_load + 0.15 * z_wind
+        risk_score = 0.50 * max(0.0, -z_sun) + 0.18 * max(0.0, -z_wind) + 0.42 * max(0.0, z_load)
+        ticks.append({
+            'tick': t,
+            'sun': sun[t],
+            'wind': wind[t],
+            'load': load[t],
+            'solar_active': solar_active,
+            'solar_peak': solar_peak,
+            'load_peak': load_peak,
+            'load_extreme': load_extreme,
+            'wind_peak': wind_peak,
+            'wind_low': wind_low,
+            'mixed_peak': mixed_peak,
+            'combo_score': combo_score,
+            'risk_score': risk_score,
+            'tail_low_load': (t >= rows - 8 and load[t] <= load_mean),
+            'charge_bias': 1.0 if mixed_peak or combo_score >= 0.80 else 0.0,
+            'protect_bias': 1.0 if risk_score >= 0.80 or (wind_low and load_peak and not solar_active) else 0.0,
+        })
+
+    windows = {
+        'solar_active': contiguous_windows([x['solar_active'] for x in ticks], min_len=3),
+        'mixed_peak': contiguous_windows([x['mixed_peak'] for x in ticks], min_len=2),
+        'wind_peak': contiguous_windows([x['wind_peak'] for x in ticks], min_len=2),
+        'risk_peak': contiguous_windows([x['protect_bias'] > 0.5 for x in ticks], min_len=2),
+    }
+    return {
+        'rows': rows,
+        'ticks': ticks,
+        'thresholds': {
+            'sun_q55': sun_q55,
+            'sun_q70': sun_q70,
+            'wind_q30': wind_q30,
+            'wind_q70': wind_q70,
+            'load_q70': load_q70,
+            'load_q85': load_q85,
+        },
+        'windows': windows,
+    }
+
+
+def get_or_build_forecast_profile(state: Dict[str, Any], bundle: Dict[str, Dict[str, Any]], object_rows: List[Dict[str, Any]], game_length: int) -> Dict[str, Any]:
+    meta = bundle.get('_meta', {})
+    key = (meta.get('source'), meta.get('path'), meta.get('rows'), tuple(sorted((r.get('address'), r.get('type')) for r in object_rows)))
+    profile = state.get('forecast_profile')
+    if isinstance(profile, dict) and profile.get('key') == key:
+        return profile.get('data', {'rows': 0, 'ticks': [], 'windows': {}})
+    data = build_forecast_profile(bundle, object_rows, game_length)
+    state['forecast_profile'] = {'key': key, 'data': data}
+    return data
+
+
+def forecast_profile_context(profile: Dict[str, Any], tick: int, horizon: int = 12) -> Dict[str, Any]:
+    ticks = profile.get('ticks', []) if isinstance(profile, dict) else []
+    if not ticks:
+        return {
+            'current': {},
+            'avg_combo_6': 0.0,
+            'avg_combo_12': 0.0,
+            'avg_risk_6': 0.0,
+            'avg_risk_12': 0.0,
+            'next_mixed_in': None,
+            'next_risk_in': None,
+            'next_solar_in': None,
+        }
+    idx = int(clamp(tick, 0, len(ticks) - 1))
+    cur = ticks[idx]
+
+    def _avg(name: str, n: int) -> float:
+        end = min(len(ticks), idx + n + 1)
+        vals = [safe_float(t.get(name, 0.0), 0.0) for t in ticks[idx:end]]
+        return sum(vals) / max(1, len(vals))
+
+    next_mixed_in = next((i - idx for i in range(idx, len(ticks)) if ticks[i].get('mixed_peak')), None)
+    next_risk_in = next((i - idx for i in range(idx, len(ticks)) if ticks[i].get('protect_bias', 0.0) > 0.5), None)
+    next_solar_in = next((i - idx for i in range(idx, len(ticks)) if ticks[i].get('solar_active')), None)
+    return {
+        'current': cur,
+        'avg_combo_6': _avg('combo_score', 6),
+        'avg_combo_12': _avg('combo_score', max(12, horizon)),
+        'avg_risk_6': _avg('risk_score', 6),
+        'avg_risk_12': _avg('risk_score', max(12, horizon)),
+        'next_mixed_in': next_mixed_in,
+        'next_risk_in': next_risk_in,
+        'next_solar_in': next_solar_in,
+    }
+
+
+def compute_target_soc(cfg: Dict[str, Any], total_capacity: float, total_soc: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> float:
+    base_ceil = min(total_capacity, total_capacity * SOC_CEIL_FRAC)
     weighted_gap = 0.0
     weighted_surplus = 0.0
     raw_gap_sum = 0.0
     raw_surplus_sum = 0.0
     useful_gap_sum = 0.0
+    max_gap = 0.0
+    solar_preds: List[float] = []
+    wind_preds: List[float] = []
     for i, row in enumerate(future):
         w = 1.0 / (i + 1)
         bal = safe_float(row.get('balance_pred', 0.0), 0.0)
@@ -1150,50 +1483,131 @@ def compute_target_soc(cfg: Dict[str, Any], total_capacity: float, total_soc: fl
         weighted_surplus += w * surplus
         raw_gap_sum += gap
         raw_surplus_sum += surplus
+        max_gap = max(max_gap, gap)
         useful_gap_sum += w * max(0.0, 1.5 - useful)
-    chronic_deficit = raw_gap_sum > max(4.0, 1.7 * raw_surplus_sum)
-    floor = total_capacity * (0.03 if chronic_deficit else SOC_FLOOR_FRAC)
-    target = floor + 0.50 * weighted_gap + 0.10 * useful_gap_sum - 0.35 * weighted_surplus
-    if fill_ratio < 0.65 and raw_surplus_sum > 0.0:
-        target += 0.03 * total_capacity
-    elif fill_ratio > 0.92 and raw_surplus_sum > raw_gap_sum:
+        type_totals = row.get('type_totals', {}) if isinstance(row.get('type_totals', {}), dict) else {}
+        solar_preds.append(safe_float(type_totals.get('solar', {}).get('gen', 0.0), 0.0))
+        wind_preds.append(safe_float(type_totals.get('wind', {}).get('gen', 0.0), 0.0))
+    chronic_deficit = raw_gap_sum > max(4.0, 1.5 * raw_surplus_sum)
+    floor = total_capacity * (0.06 if chronic_deficit else SOC_FLOOR_FRAC)
+    target = floor + 0.72 * weighted_gap + 0.18 * useful_gap_sum - 0.08 * weighted_surplus
+    target += 0.02 * total_capacity
+    if fill_ratio < 0.60 and raw_surplus_sum > 0.0:
+        target += 0.05 * total_capacity
+    elif fill_ratio > 0.90 and raw_surplus_sum > raw_gap_sum:
         target -= 0.03 * total_capacity
+    if profile_ctx:
+        current = profile_ctx.get('current', {})
+        avg_combo = safe_float(profile_ctx.get('avg_combo_12', 0.0), 0.0)
+        avg_risk = safe_float(profile_ctx.get('avg_risk_12', 0.0), 0.0)
+        next_risk_in = profile_ctx.get('next_risk_in')
+        next_mixed_in = profile_ctx.get('next_mixed_in')
+        if current.get('mixed_peak') or current.get('solar_active'):
+            target = max(target, 0.36 * total_capacity)
+        if next_risk_in is not None and 0 <= next_risk_in <= 20:
+            risk_floor = (0.62 - 0.014 * min(next_risk_in, 20)) * total_capacity
+            target = max(target, risk_floor)
+        if avg_risk > avg_combo + 0.12:
+            target = max(target, 0.42 * total_capacity)
+        if next_mixed_in is not None and 0 <= next_mixed_in <= 10 and next_risk_in is not None and next_risk_in <= 20:
+            target = max(target, 0.50 * total_capacity)
+        if current.get('tail_low_load'):
+            target -= 0.04 * total_capacity
+    solar_now = solar_preds[0] if solar_preds else 0.0
+    solar_later = avg(solar_preds[1:4], default=solar_now)
+    solar_drop_risk = max(0.0, solar_now - solar_later)
+    wind_peak = max(wind_preds[:4], default=0.0)
+    if solar_drop_risk > 0.8:
+        target += min(0.18 * total_capacity, 0.16 * solar_drop_risk)
+    if wind_peak > 12.0:
+        target += min(0.14 * total_capacity, 0.02 * wind_peak * total_capacity / max(total_capacity, 1.0))
+    if market_ctx:
+        price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0)
+        recent_fill = safe_float(market_ctx.get('recent_fill_ratio', fill_ratio), fill_ratio)
+        anti_dump_headroom = safe_float(market_ctx.get('anti_dump_headroom', 0.0), 0.0)
+        if recent_fill < safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78):
+            target += 0.05 * total_capacity
+        if price_realism < 0.60:
+            target += 0.04 * total_capacity
+        if anti_dump_headroom < 2.0 and raw_surplus_sum > 0.0:
+            target += 0.03 * total_capacity
+    target += 0.12 * max_gap
     ticks_left = max(0, game_length - tick)
     if ticks_left <= ENDGAME_TICKS:
         floor = 0.0
-        target = 0.10 * weighted_gap
+        target = max(0.0, 0.10 * weighted_gap)
     return clamp(target, floor, base_ceil)
 
 
-def storage_policy(cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_now: float, useful_now: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], Dict[str, Any]]:
+def storage_policy(cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_now: float, useful_now: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], Dict[str, Any]]:
     if not storages:
         return [], [], {
             'target_soc': 0.0,
+            'prep_soc': 0.0,
             'total_soc': 0.0,
             'charge_total': 0.0,
             'discharge_total': 0.0,
             'discharge_for_market': 0.0,
             'chronic_deficit': False,
             'floor_soc': 0.0,
+            'soc_band': 0.0,
+            'emergency_floor_soc': 0.0,
+            'working_floor_soc': 0.0,
+            'high_risk_target_soc': 0.0,
+            'allow_market_discharge': False,
         }
     cell_capacity = safe_float(cfg['cellCapacity'], 120.0)
     charge_rate = safe_float(cfg['cellChargeRate'], 15.0)
     discharge_rate = safe_float(cfg['cellDischargeRate'], 20.0)
-    total_capacity = len(storages) * cell_capacity
-    total_soc = sum(s['soc'] for s in storages)
-    total_charge_rate = len(storages) * charge_rate
-    total_discharge_rate = len(storages) * discharge_rate
-    target_soc = compute_target_soc(cfg, total_capacity, total_soc, future, fill_ratio, tick, game_length, loss_ratio=loss_ratio)
+    norm_storages = [
+        {'id': s['id'], 'soc': clamp_storage_soc(s.get('soc', 0.0), cell_capacity)}
+        for s in storages
+    ]
+    total_capacity = len(norm_storages) * cell_capacity
+    total_soc = sum(s['soc'] for s in norm_storages)
+    total_charge_rate = len(norm_storages) * charge_rate
+    total_discharge_rate = len(norm_storages) * discharge_rate
+    soc_ceil = min(total_capacity, total_capacity * SOC_CEIL_FRAC)
+    target_soc = compute_target_soc(cfg, total_capacity, total_soc, future, fill_ratio, tick, game_length, loss_ratio=loss_ratio, profile_ctx=profile_ctx, market_ctx=market_ctx)
     deficit_sum = sum(max(0.0, -safe_float(r.get('balance_pred', 0.0), 0.0)) for r in future)
     surplus_sum = sum(max(0.0, safe_float(r.get('balance_pred', 0.0), 0.0)) for r in future)
     next_deficit = max(0.0, -safe_float(future[0].get('balance_pred', 0.0), 0.0)) if future else 0.0
     next_surplus = max(0.0, safe_float(future[0].get('balance_pred', 0.0), 0.0)) if future else 0.0
-    chronic_deficit = deficit_sum > max(4.0, 1.7 * surplus_sum)
-    floor_frac = 0.03 if chronic_deficit else SOC_FLOOR_FRAC
+    chronic_deficit = deficit_sum > max(4.0, 1.5 * surplus_sum)
+    floor_frac = 0.06 if chronic_deficit else SOC_FLOOR_FRAC
     if tick >= game_length - ENDGAME_TICKS:
         floor_frac = 0.0
+    current_profile = profile_ctx.get('current', {}) if profile_ctx else {}
+    next_risk_in = profile_ctx.get('next_risk_in') if profile_ctx else None
+    next_mixed_in = profile_ctx.get('next_mixed_in') if profile_ctx else None
+    severe_risk = bool(
+        chronic_deficit and (
+            loss_ratio > 0.38
+            or current_profile.get('protect_bias', 0.0) > 0.5
+            or (next_risk_in is not None and 0 <= next_risk_in <= 12)
+        )
+    )
+    if next_risk_in is not None and 0 <= next_risk_in <= 18:
+        floor_frac = max(floor_frac, 0.10)
     floor_soc = total_capacity * floor_frac
-    protected_soc = max(floor_soc, 0.40 * target_soc if chronic_deficit else 0.65 * target_soc)
+    recent_fill = safe_float(market_ctx.get('recent_fill_ratio', fill_ratio), fill_ratio) if market_ctx else fill_ratio
+    price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0) if market_ctx else 1.0
+    overpriced_market = bool(market_ctx.get('overpriced', False)) if market_ctx else False
+    anti_dump_headroom = safe_float(market_ctx.get('anti_dump_headroom', 0.0), 0.0) if market_ctx else 0.0
+    emergency_floor_soc = max(floor_soc, total_capacity * (0.12 if severe_risk else 0.08 if chronic_deficit else 0.05))
+    working_floor_soc = max(emergency_floor_soc, total_capacity * (0.18 if recent_fill < 0.78 or price_realism < 0.65 else 0.12))
+    prep_soc = target_soc
+    if next_risk_in is not None and 0 <= next_risk_in <= 18:
+        prep_soc = max(prep_soc, (0.68 - 0.016 * min(next_risk_in, 18)) * total_capacity)
+    elif current_profile.get('mixed_peak') or current_profile.get('solar_active'):
+        prep_soc = max(prep_soc, 0.42 * total_capacity)
+    if next_mixed_in is not None and 0 <= next_mixed_in <= 8 and next_risk_in is not None and 0 <= next_risk_in <= 18:
+        prep_soc = max(prep_soc, 0.58 * total_capacity)
+    if recent_fill < 0.78 or overpriced_market or anti_dump_headroom < 2.0:
+        prep_soc = max(prep_soc, working_floor_soc + 0.08 * total_capacity)
+    prep_soc = clamp(prep_soc, floor_soc, soc_ceil)
+    high_risk_target_soc = max(prep_soc, total_capacity * (0.62 if severe_risk else 0.0))
+    protected_soc = max(working_floor_soc, 0.88 * prep_soc if severe_risk else (0.80 * prep_soc if chronic_deficit else 0.72 * prep_soc))
     charge_total = 0.0
     discharge_total = 0.0
     discharge_for_market = 0.0
@@ -1202,31 +1616,68 @@ def storage_policy(cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_
     discharge_budget = max(0.0, total_soc - protected_soc)
     if current_deficit > 0.0 and discharge_budget > 0.0:
         desired = current_deficit + 0.18 * next_deficit
-        if chronic_deficit:
-            desired += 0.08 * deficit_sum
+        if chronic_deficit or current_profile.get('protect_bias', 0.0) > 0.5:
+            desired += 0.10 * deficit_sum
+        if severe_risk:
+            desired *= 0.72
         discharge_total = min(total_discharge_rate, discharge_budget, desired)
     charge_room = max(0.0, total_capacity * SOC_CEIL_FRAC - total_soc)
+    should_charge = False
+    charge_gain = 1.00
     if current_surplus > 0.0 and charge_room > 0.0:
-        desired_charge = current_surplus * 0.98
-        if chronic_deficit or total_soc < target_soc or next_deficit > 1.0:
+        if total_soc < prep_soc:
+            should_charge = True
+            charge_gain = max(charge_gain, 1.08)
+        if chronic_deficit or next_deficit > 1.0 or severe_risk:
+            should_charge = True
+            charge_gain = max(charge_gain, 1.12)
+        if current_profile.get('mixed_peak') or current_profile.get('charge_bias', 0.0) > 0.5:
+            should_charge = True
+            charge_gain = max(charge_gain, 1.18)
+        if next_risk_in is not None and 0 <= next_risk_in <= 18:
+            should_charge = True
+            charge_gain = max(charge_gain, 1.32)
+        if next_mixed_in is not None and 0 <= next_mixed_in <= 6 and next_risk_in is not None and 0 <= next_risk_in <= 18:
+            should_charge = True
+            charge_gain = max(charge_gain, 1.38)
+        if recent_fill < 0.78 or overpriced_market or anti_dump_headroom < 2.0:
+            should_charge = True
+            charge_gain = max(charge_gain, 1.22)
+        if should_charge:
+            desired_charge = max(current_surplus * charge_gain, 0.40 * max(0.0, prep_soc - total_soc))
             charge_total = min(total_charge_rate, charge_room, desired_charge)
-    elif current_surplus <= 0.0 and next_surplus > 2.5 and total_soc < target_soc and charge_room > 0.0:
+    elif current_surplus <= 0.0 and next_surplus > 3.0 and total_soc < prep_soc and charge_room > 0.0:
         charge_total = min(total_charge_rate, charge_room, 0.55 * next_surplus)
-    if tick >= game_length - ENDGAME_TICKS and total_soc > floor_soc:
-        extra = min(max(0.0, total_discharge_rate - discharge_total), max(0.0, total_soc - floor_soc))
-        if balance_now >= -1.0 or useful_now > 0.0:
-            discharge_for_market = extra
+    allow_market_discharge = (
+        tick >= game_length - ENDGAME_TICKS
+        and total_soc > protected_soc
+        and current_surplus >= MIN_ORDER_VOLUME
+        and useful_now > current_surplus
+        and not severe_risk
+        and loss_ratio < 0.30
+        and current_profile.get('protect_bias', 0.0) <= 0.5
+        and (next_risk_in is None or next_risk_in > 3)
+        and recent_fill >= safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.92), 0.92)
+        and price_realism >= 0.72
+        and not overpriced_market
+        and anti_dump_headroom >= MIN_ORDER_VOLUME
+    )
+    if allow_market_discharge:
+        extra = min(max(0.0, total_discharge_rate - discharge_total), max(0.0, total_soc - protected_soc))
+        market_headroom = max(0.0, total_soc - max(prep_soc, protected_soc))
+        if market_headroom > 0.0:
+            discharge_for_market = min(extra, market_headroom)
             discharge_total += discharge_for_market
     if charge_total > 0.0 and discharge_total > 0.0:
-        if discharge_total >= charge_total:
-            charge_total = 0.0
-        else:
+        if charge_total >= discharge_total:
             discharge_total = 0.0
             discharge_for_market = 0.0
+        else:
+            charge_total = 0.0
     charge_orders: List[Tuple[str, float]] = []
     discharge_orders: List[Tuple[str, float]] = []
     rem = charge_total
-    for s in sorted(storages, key=lambda x: x['soc']):
+    for s in sorted(norm_storages, key=lambda x: x['soc']):
         if rem <= 1e-9:
             break
         room = max(0.0, cell_capacity - s['soc'])
@@ -1235,8 +1686,8 @@ def storage_policy(cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_
             charge_orders.append((s['id'], round_vol(amt)))
             rem -= amt
     rem = discharge_total
-    floor_per_cell = floor_soc / max(1, len(storages))
-    for s in sorted(storages, key=lambda x: -x['soc']):
+    floor_per_cell = protected_soc / max(1, len(norm_storages))
+    for s in sorted(norm_storages, key=lambda x: -x['soc']):
         if rem <= 1e-9:
             break
         avail = max(0.0, s['soc'] - floor_per_cell)
@@ -1249,70 +1700,213 @@ def storage_policy(cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_
     discharge_for_market = min(discharge_total, max(0.0, discharge_for_market))
     return charge_orders, discharge_orders, {
         'target_soc': target_soc,
+        'prep_soc': prep_soc,
         'total_soc': total_soc,
         'charge_total': charge_total,
         'discharge_total': discharge_total,
         'discharge_for_market': discharge_for_market,
         'chronic_deficit': chronic_deficit,
         'floor_soc': floor_soc,
+        'soc_band': max(0.0, prep_soc - floor_soc),
+        'emergency_floor_soc': emergency_floor_soc,
+        'working_floor_soc': working_floor_soc,
+        'high_risk_target_soc': high_risk_target_soc,
+        'allow_market_discharge': allow_market_discharge,
     }
 
 
 def analyze_topology(object_rows: List[Dict[str, Any]], network_rows: List[Dict[str, Any]], total_generated: float) -> Dict[str, Any]:
+    def _json_path(value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        try:
+            return json.loads(value) if value else []
+        except Exception:
+            return []
+
+    def _branch_key(path_data: List[Any]) -> str:
+        if not isinstance(path_data, list) or not path_data:
+            return 'unknown'
+        first_path = path_data[0]
+        if not isinstance(first_path, list) or not first_path:
+            return 'unknown'
+        edge = first_path[0]
+        if not isinstance(edge, list) or len(edge) < 2:
+            return 'unknown'
+        node = edge[0]
+        if not isinstance(node, list) or len(node) < 2:
+            return 'unknown'
+        return f'{node[0]}:{node[1]}:{edge[1]}'
+
+    def _path_count(path_data: List[Any]) -> int:
+        return sum(1 for item in path_data if isinstance(item, list))
+
     by_branch: Dict[str, Dict[str, float]] = {}
     warnings: List[str] = []
+    vulnerabilities: List[str] = []
     branch_mix: Dict[str, Dict[str, int]] = {}
+    object_path_depths: List[int] = []
+    hospital_inputs = 0
+    factory_inputs = 0
+    islanded_objects: List[str] = []
     for row in network_rows:
-        try:
-            location = json.loads(row.get('location', '[]')) if isinstance(row.get('location'), str) else row.get('location', [])
-        except Exception:
-            location = row.get('location', [])
-        branch_key = 'unknown'
-        if isinstance(location, list) and location:
-            first = location[0]
-            if isinstance(first, (list, tuple)) and len(first) >= 2:
-                branch_key = f'{first[0]}:{first[1]}'
-        bucket = by_branch.setdefault(branch_key, {'losses': 0.0, 'upflow': 0.0, 'downflow': 0.0, 'count': 0})
+        location = _json_path(row.get('location', []))
+        branch_key = _branch_key([location]) if location else 'unknown'
+        throughput = abs(safe_float(row.get('upflow', 0.0), 0.0)) + abs(safe_float(row.get('downflow', 0.0), 0.0))
+        bucket = by_branch.setdefault(branch_key, {'losses': 0.0, 'upflow': 0.0, 'downflow': 0.0, 'throughput': 0.0, 'count': 0})
         bucket['losses'] += safe_float(row.get('losses', 0.0), 0.0)
         bucket['upflow'] += safe_float(row.get('upflow', 0.0), 0.0)
         bucket['downflow'] += safe_float(row.get('downflow', 0.0), 0.0)
+        bucket['throughput'] += throughput
         bucket['count'] += 1
     for row in object_rows:
-        try:
-            path = json.loads(row.get('path', '[]')) if isinstance(row.get('path'), str) else row.get('path', [])
-        except Exception:
-            path = []
-        branch_key = 'unknown'
-        if isinstance(path, list) and path:
-            first = path[0]
-            if isinstance(first, (list, tuple)) and first and isinstance(first[0], (list, tuple)) and len(first[0]) >= 2:
-                branch_key = f'{first[0][0]}:{first[0][1]}'
-        mix = branch_mix.setdefault(branch_key, {'gen': 0, 'load': 0, 'hospital': 0, 'factory': 0})
+        path_data = _json_path(row.get('path', []))
+        branch_key = _branch_key(path_data)
+        primary_paths = _path_count(path_data)
+        first_path = path_data[0] if isinstance(path_data, list) and path_data else []
+        object_path_depths.append(len(first_path) if isinstance(first_path, list) else 0)
+        if row.get('type') != 'main' and primary_paths <= 0:
+            islanded_objects.append(row.get('address', 'unknown'))
+        if row.get('type') == 'hospital':
+            hospital_inputs = max(hospital_inputs, primary_paths)
+        if row.get('type') == 'factory':
+            factory_inputs = max(factory_inputs, primary_paths)
+        mix = branch_mix.setdefault(branch_key, {'gen': 0, 'load': 0, 'storage': 0, 'hospital': 0, 'factory': 0})
         if row.get('type') in ('solar', 'wind'):
             mix['gen'] += 1
-        if row.get('type') in ('houseA', 'houseB', 'office', 'factory', 'hospital'):
+        elif row.get('type') in ('houseA', 'houseB', 'office', 'factory', 'hospital'):
             mix['load'] += 1
+        elif row.get('type') == 'storage':
+            mix['storage'] += 1
         if row.get('type') == 'hospital':
             mix['hospital'] += 1
         if row.get('type') == 'factory':
             mix['factory'] += 1
     branch_losses_sorted = sorted(({'branch': k, **v} for k, v in by_branch.items()), key=lambda x: x['losses'], reverse=True)
-    if total_generated > 1e-9:
-        total_branch_losses = sum(x['losses'] for x in branch_losses_sorted)
-        if total_branch_losses > 0.35 * total_generated:
-            warnings.append('high_network_losses')
-        if branch_losses_sorted and branch_losses_sorted[0]['losses'] > 0.55 * total_branch_losses:
-            warnings.append('losses_concentrated_in_one_branch')
+    total_branch_losses = sum(x['losses'] for x in branch_losses_sorted)
+    total_throughput = sum(x['throughput'] for x in branch_losses_sorted)
+    branch_concentration = 0.0
+    if total_throughput > 1e-9:
+        branch_concentration = sum((x['throughput'] / total_throughput) ** 2 for x in branch_losses_sorted if x['throughput'] > 0.0)
+    loss_share_est = total_branch_losses / max(total_generated, 1e-9) if total_generated > 1e-9 else 0.0
+    expected_useful_energy = max(0.0, total_generated - total_branch_losses)
+    if loss_share_est > 0.26:
+        warnings.append('high_network_losses')
+        vulnerabilities.append('loss_share_above_empirical_safe_zone')
+    if branch_losses_sorted and total_branch_losses > 0.0 and branch_losses_sorted[0]['losses'] > 0.55 * total_branch_losses:
+        warnings.append('losses_concentrated_in_one_branch')
+        vulnerabilities.append('losses_concentrated_in_one_branch')
+    if branch_concentration > 0.56:
+        warnings.append('branch_flow_concentration')
+        vulnerabilities.append('branch_flow_concentration')
     for branch, mix in branch_mix.items():
         if mix['gen'] > 0 and mix['load'] > 0:
             warnings.append(f'mixed_branch:{branch}')
-    hospital_count = sum(1 for r in object_rows if r.get('type') == 'hospital')
-    if hospital_count > 0 and sum(safe_float(r.get('consumed', 0.0), 0.0) for r in object_rows if r.get('type') == 'hospital') <= 0.0:
-        warnings.append('hospital_zero_consumption')
-    return {'branch_losses': branch_losses_sorted[:10], 'branch_mix': branch_mix, 'warnings': warnings}
+            vulnerabilities.append(f'mixed_branch:{branch}')
+    if hospital_inputs < 2 and any(r.get('type') == 'hospital' for r in object_rows):
+        warnings.append('hospital_not_dual_fed')
+        vulnerabilities.append('hospital_not_dual_fed')
+    if factory_inputs > 2:
+        warnings.append('factory_overconnected')
+    if islanded_objects:
+        warnings.append('islanded_objects')
+        vulnerabilities.append('islanded_objects')
+    return {
+        'branch_losses': branch_losses_sorted[:10],
+        'branch_mix': branch_mix,
+        'warnings': warnings,
+        'vulnerabilities': vulnerabilities,
+        'branch_concentration_score': branch_concentration,
+        'loss_share_est': loss_share_est,
+        'expected_useful_energy': expected_useful_energy,
+        'hospital_inputs': hospital_inputs,
+        'factory_inputs': factory_inputs,
+        'is_tree_like': len(islanded_objects) == 0,
+        'avg_object_path_depth': avg(object_path_depths, default=0.0),
+    }
 
 
-def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_rows: List[Dict[str, Any]], network_losses: float, useful_supply_now: float) -> float:
+def recommend_topology_layout(object_rows: List[Dict[str, Any]], topology: Dict[str, Any]) -> Dict[str, Any]:
+    branch_mix = topology.get('branch_mix', {})
+    branches = [branch for branch in branch_mix.keys() if branch != 'unknown']
+    if not branches:
+        return {
+            'headline': 'insufficient_topology_data',
+            'generation_priority': [],
+            'consumer_priority': [],
+            'recommendations': [],
+        }
+
+    def gen_rank(row: Dict[str, Any]) -> Tuple[float, float]:
+        address = row.get('address', '').split('|')[0]
+        prior = PRODUCER_INSIGHTS.get(address, {})
+        strength = safe_float(prior.get('strength', 1.0), 1.0)
+        stability = safe_float(prior.get('stability', 0.6), 0.6)
+        risk = safe_float(prior.get('storm_risk', 0.0), 0.0)
+        return (strength + 0.35 * stability - 0.25 * risk, row.get('generated', 0.0))
+
+    generation_objects = sorted(
+        [row for row in object_rows if row.get('type') in ('solar', 'wind')],
+        key=gen_rank,
+        reverse=True,
+    )
+    consumer_objects = sorted(
+        [row for row in object_rows if row.get('type') in ('office', 'hospital', 'houseA', 'factory', 'houseB')],
+        key=lambda row: (
+            {'office': 1.00, 'hospital': 0.88, 'houseA': 0.82, 'factory': 0.72, 'houseB': 0.64}.get(row.get('type', ''), 0.5),
+            row.get('consumed', 0.0),
+        ),
+        reverse=True,
+    )
+    load_branch = max(branches, key=lambda branch: branch_mix.get(branch, {}).get('load', 0))
+    gen_branches = sorted(branches, key=lambda branch: branch_mix.get(branch, {}).get('gen', 0))
+    preferred_gen_branches = gen_branches[:2] if len(gen_branches) >= 2 else gen_branches
+    recommendations = [
+        f'dedicate_branch_for_loads:{load_branch}',
+        f'split_generation_across:{preferred_gen_branches}',
+        'keep_hospital_dual_fed',
+        'avoid_mixing_generation_and_consumers_in_one_district',
+        'place_storage_near_risky_generation_or_between_generation_and_main_load_branch',
+    ]
+    if topology.get('branch_concentration_score', 0.0) > 0.52:
+        recommendations.append('reduce_main_branch_concentration')
+    if 'hospital_not_dual_fed' in topology.get('vulnerabilities', []):
+        recommendations.append('hospital_second_feed_is_mandatory')
+    return {
+        'headline': f'load_branch={load_branch}; generation_split={preferred_gen_branches}',
+        'generation_priority': [row.get('address', '') for row in generation_objects],
+        'consumer_priority': [row.get('type', '') + ':' + row.get('address', '') for row in consumer_objects],
+        'recommendations': recommendations,
+    }
+
+
+def recommend_market_posture(market_ctx: Dict[str, Any], topology: Dict[str, Any], battery_dbg: Dict[str, Any]) -> Dict[str, Any]:
+    recent_fill = safe_float(market_ctx.get('recent_fill_ratio', 0.0), 0.0)
+    price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0)
+    concentration = safe_float(topology.get('branch_concentration_score', 0.0), 0.0)
+    discharge_for_market = safe_float(battery_dbg.get('discharge_for_market', 0.0), 0.0)
+    if recent_fill < safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.72), 0.72) or price_realism < 0.62:
+        mode = 'defensive_sell'
+        ask_band = [MARKET_INSIGHTS['preferred_ask_low'], MARKET_INSIGHTS['preferred_ask_high']]
+    elif concentration > 0.52:
+        mode = 'loss_aware_sell'
+        ask_band = [MARKET_INSIGHTS['preferred_ask_low'], MARKET_INSIGHTS['preferred_ask_high']]
+    elif discharge_for_market > 0.0:
+        mode = 'storage_supported_sell'
+        ask_band = [MARKET_INSIGHTS['preferred_ask_low'] + 0.2, MARKET_INSIGHTS['preferred_ask_high'] + 0.4]
+    else:
+        mode = 'balanced_sell'
+        ask_band = [MARKET_INSIGHTS['preferred_ask_low'], MARKET_INSIGHTS['preferred_ask_high'] + 0.2]
+    return {
+        'mode': mode,
+        'ask_band': ask_band,
+        'recent_fill_ratio': recent_fill,
+        'price_realism': price_realism,
+        'overpriced': bool(market_ctx.get('overpriced', False)),
+    }
+
+
+def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_rows: List[Dict[str, Any]], network_losses: float, useful_supply_now: float, profile_ctx: Optional[Dict[str, Any]] = None) -> float:
     gen_total = sum(r['generated'] for r in object_rows)
     wind_gen = sum(r['generated'] for r in object_rows if r['type'] == 'wind')
     wind_share = wind_gen / max(gen_total, 1e-9) if gen_total > 0 else 0.0
@@ -1320,38 +1914,66 @@ def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_
     loss_ratio = safe_float(state.get('loss_ratio_ewma', 0.18), 0.18)
     next_useful = safe_float(future[0].get('useful_supply_pred', 0.0), 0.0) if future else useful_supply_now
     next_balance = safe_float(future[0].get('balance_pred', 0.0), 0.0) if future else 0.0
-    reserve = 0.18 + 0.35 * abs_err + 0.10 * max(0.0, loss_ratio - 0.10) * max(gen_total, useful_supply_now)
-    reserve += 0.08 * wind_share * max(wind_gen, next_useful)
+    reserve = 0.18 + 0.28 * abs_err + 0.08 * max(0.0, loss_ratio - 0.10) * max(gen_total, useful_supply_now)
+    reserve += 0.06 * wind_share * max(wind_gen, next_useful)
     if next_useful < useful_supply_now:
-        reserve += 0.18 * (useful_supply_now - next_useful)
+        reserve += 0.14 * (useful_supply_now - next_useful)
     if next_balance < -2.0:
-        reserve += 0.05 * abs(next_balance)
+        reserve += 0.04 * abs(next_balance)
+    if profile_ctx:
+        current = profile_ctx.get('current', {})
+        avg_combo = safe_float(profile_ctx.get('avg_combo_12', 0.0), 0.0)
+        avg_risk = safe_float(profile_ctx.get('avg_risk_12', 0.0), 0.0)
+        if current.get('mixed_peak') or avg_combo > avg_risk + 0.10:
+            reserve *= 0.88
+        if current.get('protect_bias', 0.0) > 0.5 or avg_risk > avg_combo + 0.10:
+            reserve *= 1.10
     if useful_supply_now > 0.0:
-        reserve = min(reserve, max(MIN_RESERVE, 0.22 * useful_supply_now))
+        reserve = min(reserve, max(MIN_RESERVE, 0.18 * useful_supply_now))
     return max(MIN_RESERVE, reserve)
 
 
-def build_ladder(sell_volume: float, market_ref: float, fill_ratio: float, max_tickets: int, cfg: Dict[str, Any], buy_ref: Optional[float] = None) -> List[Tuple[float, float]]:
+def build_ladder(sell_volume: float, market_ref: float, fill_ratio: float, max_tickets: int, cfg: Dict[str, Any], buy_ref: Optional[float] = None, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> List[Tuple[float, float]]:
     if sell_volume < MIN_ORDER_VOLUME:
         return []
-    market_cap = safe_float(cfg.get('exchangeExternalBuy', 20.0), 20.0)
-    gp_price = safe_float(cfg.get('exchangeExternalSell', 2.0), 2.0)
+    market_cap = clamp(safe_float(cfg.get('exchangeExternalBuy', MARKET_PRICE_MAX), MARKET_PRICE_MAX), MARKET_PRICE_MIN, MARKET_PRICE_MAX)
+    gp_price = clamp(safe_float(cfg.get('exchangeExternalSell', MARKET_PRICE_MIN), MARKET_PRICE_MIN), MARKET_PRICE_MIN, market_cap)
     step = safe_float(cfg.get('exchangeConsumerPriceStep', 0.2), 0.2)
+    max_tickets = max(0, safe_int(max_tickets, 0))
     buy_ref = safe_float(buy_ref, market_ref if buy_ref is not None else market_ref)
+    current = profile_ctx.get('current', {}) if profile_ctx else {}
+    avg_combo = safe_float(profile_ctx.get('avg_combo_12', 0.0), 0.0) if profile_ctx else 0.0
+    avg_risk = safe_float(profile_ctx.get('avg_risk_12', 0.0), 0.0) if profile_ctx else 0.0
+    price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0) if market_ctx else 1.0
+    overpriced = bool(market_ctx.get('overpriced', False)) if market_ctx else False
+    weak_fill = bool(market_ctx.get('weak_fill', False)) if market_ctx else fill_ratio < safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78)
     base_ref = max(market_ref, buy_ref)
-    base_ref = clamp(base_ref, gp_price + step, market_cap - step)
+    if fill_ratio < 0.55:
+        base_ref -= 1.2 * step
+    elif fill_ratio > 0.90:
+        base_ref += 1.0 * step
+    if current.get('mixed_peak') or avg_combo > avg_risk + 0.10:
+        base_ref += 0.8 * step
+    if current.get('protect_bias', 0.0) > 0.5 or avg_risk > avg_combo + 0.15:
+        base_ref -= 0.6 * step
+    if weak_fill or overpriced:
+        base_ref = min(base_ref, safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 4.6), 4.6))
+    if price_realism < 0.65:
+        base_ref = min(base_ref, safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 4.6), 4.6))
+    base_ref = clamp(base_ref, MARKET_PRICE_MIN, market_cap)
+
     if sell_volume < 1.5:
-        prices = [gp_price, min(base_ref, gp_price + 4 * step)]
-        shares = [0.75, 0.25]
-    elif fill_ratio < 0.65:
-        prices = [gp_price, gp_price + 2 * step, min(base_ref, gp_price + 6 * step)]
-        shares = [0.72, 0.20, 0.08]
-    elif fill_ratio > 0.92:
-        prices = [gp_price + step, min(base_ref, gp_price + 5 * step), min(base_ref + 4 * step, market_cap - step)]
+        prices = [max(MARKET_PRICE_MIN, gp_price + step, base_ref - step), min(base_ref + 2 * step, market_cap)]
+        shares = [0.85, 0.15]
+    elif fill_ratio < 0.55 or weak_fill:
+        prices = [max(MARKET_PRICE_MIN, gp_price + step, base_ref - 2 * step), base_ref, min(base_ref + 3 * step, market_cap)]
+        shares = [0.82, 0.13, 0.05]
+    elif fill_ratio > 0.92 and (current.get('mixed_peak') or avg_combo > avg_risk):
+        prices = [max(MARKET_PRICE_MIN, gp_price + 2 * step, base_ref - step), min(base_ref + 2 * step, market_cap), min(base_ref + 5 * step, market_cap)]
         shares = [0.58, 0.27, 0.15]
     else:
-        prices = [gp_price + step, min(base_ref, gp_price + 4 * step), min(base_ref + 3 * step, market_cap - step)]
-        shares = [0.66, 0.24, 0.10]
+        prices = [max(MARKET_PRICE_MIN, gp_price + step, base_ref - step), min(base_ref + 2 * step, market_cap), min(base_ref + 4 * step, market_cap)]
+        shares = [0.70, 0.22, 0.08]
     prices = [round_price(p, price_max=market_cap, price_step=step) for p in prices]
     out: List[Tuple[float, float]] = []
     allocated = 0.0
@@ -1364,6 +1986,29 @@ def build_ladder(sell_volume: float, market_ref: float, fill_ratio: float, max_t
         if vol >= MIN_ORDER_VOLUME:
             out.append((round_vol(vol), prices[i]))
     return out[:max_tickets]
+
+
+def compute_safe_sell_volume(state: Dict[str, Any], object_rows: List[Dict[str, Any]], marketable_useful_now: float, offer_cap: float, reserve: float, balance_now: float, topology: Dict[str, Any], market_ctx: Dict[str, Any]) -> float:
+    gen_total = sum(r['generated'] for r in object_rows)
+    wind_total = sum(r['generated'] for r in object_rows if r.get('type') == 'wind')
+    wind_share = wind_total / max(gen_total, 1e-9) if gen_total > 0.0 else 0.0
+    loss_ratio = safe_float(state.get('loss_ratio_ewma', 0.18), 0.18)
+    abs_err = safe_float(state.get('abs_err_ewma', 1.2), 1.2)
+    recent_fill = safe_float(market_ctx.get('recent_fill_ratio', safe_float(state.get('fill_ratio_ewma', 0.74), 0.74)), 0.74)
+    price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0)
+    uncertainty = 0.22 * abs_err + 0.12 * wind_share * marketable_useful_now
+    uncertainty += 0.10 * max(0.0, loss_ratio - 0.12) * marketable_useful_now
+    if 'high_network_losses' in topology.get('warnings', []):
+        uncertainty += 0.08 * marketable_useful_now
+    safe_target = max(0.0, min(offer_cap, marketable_useful_now) - max(reserve, uncertainty))
+    if recent_fill < safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78):
+        safe_target *= clamp(0.45 + 0.70 * recent_fill, 0.30, 0.95)
+    if price_realism < 0.70:
+        safe_target *= clamp(price_realism, 0.25, 1.0)
+    if balance_now < 0.0:
+        safe_target = min(safe_target, max(0.0, balance_now + marketable_useful_now))
+    safe_target = round_vol(max(0.0, min(offer_cap, marketable_useful_now, safe_target)))
+    return safe_target if safe_target >= MIN_ORDER_VOLUME else 0.0
 
 
 def current_theoretical_metrics(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weather: Dict[str, float], bundle: Dict[str, Dict[str, Any]], tick: int, cfg: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -1456,15 +2101,11 @@ def log_tick_data(tick: int, state: Dict[str, Any], object_rows: List[Dict[str, 
             'cum_loss': round(safe_float(cum.get('loss', 0.0), 0.0), 6),
             'cum_ticks': safe_int(cum.get('ticks', 0), 0),
         })
-        append_csv(OBJECTS_CSV, [
-            'tick', 'id', 'type', 'contract', 'address', 'path',
-            'generated', 'consumed', 'income', 'loss', 'charge_now', 'wind_rotation', 'failed',
-            'cum_generated', 'cum_consumed', 'cum_income', 'cum_loss', 'cum_ticks',
-        ], csv_row)
+        append_csv(OBJECTS_CSV, OBJECTS_FIELDNAMES, make_csv_row(OBJECTS_FIELDNAMES, csv_row))
     for row in network_rows:
         csv_row = {'tick': tick}
         csv_row.update(row)
-        append_csv(NETWORKS_CSV, ['tick', 'network_index', 'location', 'upflow', 'downflow', 'losses'], csv_row)
+        append_csv(NETWORKS_CSV, NETWORKS_FIELDNAMES, make_csv_row(NETWORKS_FIELDNAMES, csv_row))
     for idx, row in enumerate(exchange_rows):
         csv_row = {'tick': tick, 'receipt_index': idx}
         csv_row.update(row)
@@ -1473,15 +2114,12 @@ def log_tick_data(tick: int, state: Dict[str, Any], object_rows: List[Dict[str, 
             'abs_contractedAmount': round(abs(safe_float(row.get('contractedAmount', 0.0), 0.0)), 6),
             'abs_instantAmount': round(abs(safe_float(row.get('instantAmount', 0.0), 0.0)), 6),
         })
-        append_csv(EXCHANGE_CSV, [
-            'tick', 'receipt_index', 'side', 'askedAmount', 'askedPrice', 'contractedAmount', 'contractedPrice', 'instantAmount',
-            'abs_askedAmount', 'abs_contractedAmount', 'abs_instantAmount',
-        ], csv_row)
+        append_csv(EXCHANGE_CSV, EXCHANGE_FIELDNAMES, make_csv_row(EXCHANGE_FIELDNAMES, csv_row))
     if derived_row is not None:
-        append_csv(DERIVED_METRICS_CSV, list(derived_row.keys()), derived_row)
+        append_csv(DERIVED_METRICS_CSV, DERIVED_METRICS_FIELDNAMES, make_csv_row(DERIVED_METRICS_FIELDNAMES, derived_row))
     if object_prediction_rows:
         for row in object_prediction_rows:
-            append_csv(OBJECT_PREDICTIONS_CSV, list(row.keys()), row)
+            append_csv(OBJECT_PREDICTIONS_CSV, OBJECT_PREDICTIONS_FIELDNAMES, make_csv_row(OBJECT_PREDICTIONS_FIELDNAMES, row))
 
 
 # =====================
@@ -1512,6 +2150,8 @@ def controller(psm: Any) -> Dict[str, Any]:
     update_forecast_error_log(tick, state, object_rows, weather, forecast_bundle, total_consumed)
     update_models(state, object_rows, weather, forecast_bundle, tick, cfg, total_consumed=total_consumed, total_losses=total_losses)
 
+    forecast_profile = get_or_build_forecast_profile(state, forecast_bundle, object_rows, game_length)
+    profile_ctx = forecast_profile_context(forecast_profile, tick, horizon=max(12, LOOKAHEAD * 2))
     future = forecast_window(state, object_rows, forecast_bundle, tick, game_length, LOOKAHEAD)
     current_theoretical, object_prediction_rows = current_theoretical_metrics(state, object_rows, weather, forecast_bundle, tick, cfg)
 
@@ -1533,11 +2173,12 @@ def controller(psm: Any) -> Dict[str, Any]:
         state['market_ref'] = 0.88 * safe_float(state.get('market_ref', 4.8), 4.8) + 0.12 * last_log_price
     if fill_ratio_now is not None:
         state['fill_ratio_ewma'] = 0.76 * safe_float(state.get('fill_ratio_ewma', 0.74), 0.74) + 0.24 * fill_ratio_now
+    update_market_history(state, tick, market_stats)
+    market_ctx = build_market_context(state, market_stats)
+    anti_dump_cap_preview = compute_offer_cap(state, cfg, tick, useful_now)
+    market_ctx['anti_dump_cap'] = anti_dump_cap_preview
+    market_ctx['anti_dump_headroom'] = max(0.0, anti_dump_cap_preview - safe_float(state.get('last_sell_volume', 0.0), 0.0))
 
-    prev_useful_est = state.get('prev_useful_supply_est')
-    if prev_useful_est is not None:
-        err = useful_now - safe_float(prev_useful_est, 0.0)
-        state['abs_err_ewma'] = 0.84 * safe_float(state.get('abs_err_ewma', 1.2), 1.2) + 0.16 * abs(err)
     if total_generated > 1e-9:
         current_loss_ratio = clamp(total_losses / total_generated, 0.0, 0.8)
         state['loss_ratio_ewma'] = 0.88 * safe_float(state.get('loss_ratio_ewma', 0.18), 0.18) + 0.12 * current_loss_ratio
@@ -1546,15 +2187,36 @@ def controller(psm: Any) -> Dict[str, Any]:
         cfg, obj_agg['storages'], balance_now, useful_now, future,
         safe_float(state.get('fill_ratio_ewma', 0.74), 0.74), tick, game_length,
         loss_ratio=safe_float(state.get('loss_ratio_ewma', 0.18), 0.18),
+        profile_ctx=profile_ctx,
+        market_ctx=market_ctx,
     )
+    design_recommendation = recommend_topology_layout(object_rows, topology)
+    market_recommendation = recommend_market_posture(market_ctx, topology, battery_dbg)
 
-    marketable_useful_now = max(0.0, useful_now + battery_dbg['discharge_total'] - battery_dbg['charge_total'])
+    gross_marketable_useful_now = max(0.0, useful_now + battery_dbg['discharge_for_market'] - battery_dbg['charge_total'])
+    stress_sell_mode = bool(
+        balance_now < 0.0
+        or safe_float(state.get('loss_ratio_ewma', 0.18), 0.18) > 0.30
+        or profile_ctx.get('current', {}).get('protect_bias', 0.0) > 0.5
+        or 'high_network_losses' in topology.get('warnings', [])
+    )
+    marketable_useful_now = gross_marketable_useful_now
+    if stress_sell_mode:
+        marketable_useful_now = min(
+            marketable_useful_now,
+            max(0.0, balance_now + battery_dbg['discharge_for_market'] - battery_dbg['charge_total']),
+        )
+    prev_useful_est = state.get('prev_useful_supply_est')
+    if prev_useful_est is not None:
+        err = marketable_useful_now - safe_float(prev_useful_est, 0.0)
+        state['abs_err_ewma'] = 0.84 * safe_float(state.get('abs_err_ewma', 1.2), 1.2) + 0.16 * abs(err)
     offer_cap = compute_offer_cap(state, cfg, tick, marketable_useful_now)
-    reserve = compute_reserve(state, future, object_rows, total_losses, marketable_useful_now)
-    sell_target = max(0.0, min(offer_cap, marketable_useful_now) - reserve)
-    if marketable_useful_now >= MIN_ORDER_VOLUME and sell_target < MIN_ORDER_VOLUME:
-        sell_target = min(offer_cap, marketable_useful_now, max(MIN_ORDER_VOLUME, 0.60 * marketable_useful_now))
-    sell_volume = round_vol(clamp(sell_target, 0.0, min(offer_cap, marketable_useful_now)))
+    reserve = compute_reserve(state, future, object_rows, total_losses, marketable_useful_now, profile_ctx=profile_ctx)
+    market_ctx['anti_dump_cap'] = offer_cap
+    market_ctx['anti_dump_headroom'] = max(0.0, offer_cap - safe_float(state.get('last_sell_volume', 0.0), 0.0))
+    sell_volume = compute_safe_sell_volume(state, object_rows, marketable_useful_now, offer_cap, reserve, balance_now, topology, market_ctx)
+    if marketable_useful_now >= MIN_ORDER_VOLUME and sell_volume <= 0.0 and market_ctx.get('good_fill') and safe_float(market_ctx.get('price_realism', 1.0), 1.0) >= 0.85:
+        sell_volume = round_vol(min(offer_cap, marketable_useful_now, max(MIN_ORDER_VOLUME, 0.48 * marketable_useful_now)))
 
     ladder = build_ladder(
         sell_volume,
@@ -1563,6 +2225,8 @@ def controller(psm: Any) -> Dict[str, Any]:
         safe_int(cfg['exchangeMaxTickets'], 100),
         cfg,
         buy_ref=buy_ref,
+        profile_ctx=profile_ctx,
+        market_ctx=market_ctx,
     )
 
     if hasattr(psm, 'orders'):
@@ -1590,6 +2254,9 @@ def controller(psm: Any) -> Dict[str, Any]:
         'forecast_source': forecast_meta.get('source'),
         'forecast_path': forecast_meta.get('path'),
         'forecast_rows': forecast_meta.get('rows'),
+        'profile_current': profile_ctx.get('current', {}),
+        'profile_next_mixed_in': profile_ctx.get('next_mixed_in'),
+        'profile_next_risk_in': profile_ctx.get('next_risk_in'),
         'solar_actual': round(safe_float(obj_agg['by_type'].get('solar', {}).get('generated', 0.0), 0.0), 6),
         'wind_actual': round(safe_float(obj_agg['by_type'].get('wind', {}).get('generated', 0.0), 0.0), 6),
         'solar_theoretical_now': round(current_theoretical['solar_theoretical_now'], 6),
@@ -1612,10 +2279,17 @@ def controller(psm: Any) -> Dict[str, Any]:
         'reserve': round(reserve, 6),
         'charge_total': round(battery_dbg['charge_total'], 6),
         'discharge_total': round(battery_dbg['discharge_total'], 6),
+        'discharge_for_market': round(safe_float(battery_dbg.get('discharge_for_market', 0.0), 0.0), 6),
         'target_soc': round(battery_dbg['target_soc'], 6),
+        'prep_soc': round(safe_float(battery_dbg.get('prep_soc', battery_dbg['target_soc']), battery_dbg['target_soc']), 6),
         'total_soc': round(battery_dbg['total_soc'], 6),
+        'emergency_floor_soc': round(safe_float(battery_dbg.get('emergency_floor_soc', 0.0), 0.0), 6),
+        'working_floor_soc': round(safe_float(battery_dbg.get('working_floor_soc', 0.0), 0.0), 6),
+        'high_risk_target_soc': round(safe_float(battery_dbg.get('high_risk_target_soc', battery_dbg['target_soc']), battery_dbg['target_soc']), 6),
         'market_ref': round(safe_float(state.get('market_ref', 4.8), 4.8), 6),
         'fill_ratio_ewma': round(safe_float(state.get('fill_ratio_ewma', 0.74), 0.74), 6),
+        'market_price_realism': round(safe_float(market_ctx.get('price_realism', 1.0), 1.0), 6),
+        'market_overpriced': bool(market_ctx.get('overpriced', False)),
         'buy_asked': round(safe_float(market_stats.get('buy_asked', 0.0), 0.0), 6),
         'buy_contracted': round(safe_float(market_stats.get('buy_contracted', 0.0), 0.0), 6),
         'buy_instant': round(safe_float(market_stats.get('buy_instant', 0.0), 0.0), 6),
@@ -1628,6 +2302,11 @@ def controller(psm: Any) -> Dict[str, Any]:
         'sell_avg_contracted_price': market_stats.get('sell_avg_contracted_price'),
         'ladder': ladder,
         'topology_warnings': topology.get('warnings', []),
+        'topology_branch_concentration': round(safe_float(topology.get('branch_concentration_score', 0.0), 0.0), 6),
+        'topology_loss_share_est': round(safe_float(topology.get('loss_share_est', 0.0), 0.0), 6),
+        'topology_vulnerabilities': topology.get('vulnerabilities', []),
+        'design_headline': design_recommendation.get('headline'),
+        'market_mode': market_recommendation.get('mode'),
         'type_totals': {
             typ: {
                 'count': data['count'],
@@ -1657,11 +2336,17 @@ def controller(psm: Any) -> Dict[str, Any]:
             'weatherEffectsDelay': cfg['weatherEffectsDelay'],
         },
         'models': state.get('object_models', {}),
+        'forecast_profile_context': profile_ctx,
         'future_window': future,
         'topology': topology,
+        'design_recommendation': design_recommendation,
+        'market_recommendation': market_recommendation,
+        'market_context': market_ctx,
         'physical_balance_now': balance_now,
         'useful_supply_now': useful_now,
+        'gross_marketable_useful_now': gross_marketable_useful_now,
         'marketable_useful_now': marketable_useful_now,
+        'stress_sell_mode': stress_sell_mode,
         'reserve_formula': {
             'abs_err_ewma': safe_float(state.get('abs_err_ewma', 1.2), 1.2),
             'loss_ratio_ewma': safe_float(state.get('loss_ratio_ewma', 0.18), 0.18),
@@ -1680,6 +2365,9 @@ def controller(psm: Any) -> Dict[str, Any]:
         'wind_now': round(weather['wind'], 6),
         'forecast_source': forecast_meta.get('source'),
         'forecast_rows': forecast_meta.get('rows'),
+        'profile_current': profile_ctx.get('current', {}),
+        'profile_next_mixed_in': profile_ctx.get('next_mixed_in'),
+        'profile_next_risk_in': profile_ctx.get('next_risk_in'),
         'solar_actual': round(safe_float(obj_agg['by_type'].get('solar', {}).get('generated', 0.0), 0.0), 6),
         'wind_actual': round(safe_float(obj_agg['by_type'].get('wind', {}).get('generated', 0.0), 0.0), 6),
         'gross_actual': round(total_generated, 6),
@@ -1704,12 +2392,23 @@ def controller(psm: Any) -> Dict[str, Any]:
         'sell_avg_contracted_price': market_stats.get('sell_avg_contracted_price'),
         'storage_soc_total': round(battery_dbg['total_soc'], 6),
         'storage_target_soc': round(battery_dbg['target_soc'], 6),
+        'storage_prep_soc': round(safe_float(battery_dbg.get('prep_soc', battery_dbg['target_soc']), battery_dbg['target_soc']), 6),
+        'storage_emergency_floor_soc': round(safe_float(battery_dbg.get('emergency_floor_soc', 0.0), 0.0), 6),
+        'storage_working_floor_soc': round(safe_float(battery_dbg.get('working_floor_soc', 0.0), 0.0), 6),
+        'storage_high_risk_target_soc': round(safe_float(battery_dbg.get('high_risk_target_soc', battery_dbg['target_soc']), battery_dbg['target_soc']), 6),
         'storage_charge_total': round(battery_dbg['charge_total'], 6),
         'storage_discharge_total': round(battery_dbg['discharge_total'], 6),
+        'storage_discharge_for_market': round(safe_float(battery_dbg.get('discharge_for_market', 0.0), 0.0), 6),
         'offer_cap': round(offer_cap, 6),
         'reserve': round(reserve, 6),
         'sell_volume': round(sell_volume, 6),
+        'market_price_realism': round(safe_float(market_ctx.get('price_realism', 1.0), 1.0), 6),
+        'market_overpriced': bool(market_ctx.get('overpriced', False)),
         'topology_warning_count': len(topology.get('warnings', [])),
+        'topology_branch_concentration': round(safe_float(topology.get('branch_concentration_score', 0.0), 0.0), 6),
+        'topology_loss_share_est': round(safe_float(topology.get('loss_share_est', 0.0), 0.0), 6),
+        'topology_vulnerabilities': topology.get('vulnerabilities', []),
+        'forecast_profile_context': profile_ctx,
         'cum_solar_actual': round(safe_float(cumulative.get('solar_generated', 0.0), 0.0), 6),
         'cum_wind_actual': round(safe_float(cumulative.get('wind_generated', 0.0), 0.0), 6),
         'cum_gross_actual': round(safe_float(cumulative.get('gross_generated', 0.0), 0.0), 6),
@@ -1723,6 +2422,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     }
     log_tick_data(tick, state, object_rows, network_rows, exchange_rows, summary_row, strategy_row, derived_row, object_prediction_rows)
     state['prev_useful_supply_est'] = marketable_useful_now
+    state['prev_useful_energy_actual'] = useful_now
     state['last_sell_volume'] = sell_volume
     save_state(state)
     return summary_row
