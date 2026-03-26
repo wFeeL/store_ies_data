@@ -20,6 +20,11 @@ BALANCE_BUFFER = 0.35
 MAX_SOC_FRAC = 0.92
 MIN_SOC_FRAC = 0.10
 ENDGAME_TICKS = 5
+SECOND_HALF_TARGET_CAP_FRAC = 0.60
+MARKET_SOC_MARGIN_FRAC = 0.015
+MARKET_DISCHARGE_RATE_FRAC = 0.35
+MARKET_HEADWIND_FRAC = 0.05
+MIN_MARKET_SURPLUS = 0.15
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -196,20 +201,24 @@ def choose_storage_target(total_capacity: float, future_balances: List[float], t
     future_surplus = sum(max(0.0, value) for value in future_balances[:3])
     worst_future = min(future_balances) if future_balances else 0.0
 
-    emergency_frac = MIN_SOC_FRAC
-    target_frac = 0.55
+    emergency_frac = 0.08
+    target_frac = 0.50
     if future_deficit > 4.0 or worst_future < -2.0:
-        target_frac = 0.72
-        emergency_frac = 0.16
+        target_frac = 0.62
+        emergency_frac = 0.12
     elif future_deficit > future_surplus + 1.0:
-        target_frac = 0.64
-        emergency_frac = 0.13
+        target_frac = 0.56
+        emergency_frac = 0.10
     elif future_surplus > future_deficit + 2.0:
-        target_frac = 0.40
+        target_frac = 0.36
+
+    if tick >= game_length // 2:
+        target_frac = min(target_frac, SECOND_HALF_TARGET_CAP_FRAC)
+        emergency_frac = min(emergency_frac, 0.10)
 
     if tick >= game_length - ENDGAME_TICKS:
         emergency_frac = 0.03
-        target_frac = min(target_frac, 0.22)
+        target_frac = min(target_frac, 0.18)
 
     emergency_floor = total_capacity * emergency_frac
     target_soc = clamp(total_capacity * target_frac, emergency_floor, total_capacity * MAX_SOC_FRAC)
@@ -284,6 +293,7 @@ def decide_storage_actions(psm: Any, storages: List[Dict[str, Any]], balance_now
     avg_future = avg(future_balances, balance_now['balance'])
     future_deficit = sum(max(0.0, -value) for value in future_balances[:3])
     future_surplus = sum(max(0.0, value) for value in future_balances[:3])
+    future_headwind = sum(max(0.0, -value) for value in future_balances[:2])
 
     charge_cap = max(0.0, total_capacity * MAX_SOC_FRAC - total_soc)
     discharge_cap = max(0.0, total_soc - emergency_floor)
@@ -306,9 +316,12 @@ def decide_storage_actions(psm: Any, storages: List[Dict[str, Any]], balance_now
         desired = max(0.0, target_soc + 0.08 * total_capacity - total_soc)
         charge_total = min(len(storages) * charge_rate, charge_cap, 0.70 * immediate_surplus, desired)
         mode = 'charge'
-    elif total_soc > 0.86 * total_capacity and avg_future > -0.5:
-        extra = max(0.0, total_soc - max(target_soc, emergency_floor))
-        market_discharge = min(0.5 * len(storages) * discharge_rate, extra)
+
+    market_margin = max(MIN_ORDER_VOLUME, MARKET_SOC_MARGIN_FRAC * total_capacity)
+    if mode == 'hold' and immediate_surplus > MIN_MARKET_SURPLUS:
+        extra = max(0.0, total_soc - max(target_soc + market_margin, emergency_floor))
+        market_budget = max(0.0, extra - MARKET_HEADWIND_FRAC * future_headwind)
+        market_discharge = min(MARKET_DISCHARGE_RATE_FRAC * len(storages) * discharge_rate, market_budget)
         if market_discharge >= MIN_ORDER_VOLUME:
             discharge_total = market_discharge
             mode = 'discharge'
