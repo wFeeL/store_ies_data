@@ -2648,10 +2648,19 @@ def controller(psm: Any) -> Dict[str, Any]:
     sell_volume = compute_safe_sell_volume(state, object_rows, marketable_useful_now, offer_cap, reserve, balance_now, topology, market_ctx)
     storage_sell_guard_gap = max(MIN_ORDER_VOLUME, 0.006 * len(obj_agg['storages']) * safe_float(cfg['cellCapacity'], 120.0))
     premium_sell_ready = bool(battery_dbg.get('premium_sell_ready', False))
+    prep_soc_now = safe_float(
+        battery_dbg.get('prep_soc', battery_dbg.get('target_soc', 0.0)),
+        safe_float(battery_dbg.get('target_soc', 0.0), 0.0),
+    )
+    total_soc_now = safe_float(battery_dbg.get('total_soc', 0.0), 0.0)
     physical_storage_room_after_orders = max(
         0.0,
         safe_float(battery_dbg.get('soc_ceil', 0.0), 0.0)
-        - (safe_float(battery_dbg.get('total_soc', 0.0), 0.0) + safe_float(battery_dbg.get('charge_total', 0.0), 0.0)),
+        - (total_soc_now + safe_float(battery_dbg.get('charge_total', 0.0), 0.0)),
+    )
+    storage_needs_capture = bool(
+        prep_soc_now > total_soc_now + storage_sell_guard_gap
+        or battery_dbg.get('fill_to_ceiling', False)
     )
     storage_is_nearly_full = physical_storage_room_after_orders <= storage_sell_guard_gap
     preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 5.0), 5.0)
@@ -2668,6 +2677,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     )
     sell_blocked_for_storage = bool(
         stable_surplus_now >= MIN_ORDER_VOLUME
+        and storage_needs_capture
         and physical_storage_room_after_orders > storage_sell_guard_gap
         and battery_dbg.get('charge_total', 0.0) <= 0.0
         and not hot_price_sell_ready
