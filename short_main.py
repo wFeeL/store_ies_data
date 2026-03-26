@@ -15,6 +15,7 @@ STORAGE_TYPE = 'storage'
 LOOKAHEAD_TICKS = 4
 MIN_ORDER_VOLUME = 0.25
 BALANCE_BUFFER = 0.30
+DEFICIT_DISCHARGE_THRESHOLD = 0.12
 MAX_SOC_FRAC = 0.92
 MIN_FLOOR_FRAC = 0.08
 ENDGAME_TICKS = 5
@@ -62,9 +63,15 @@ def classify_objects(psm: Any) -> Dict[str, List[Any]]:
 def storage_rows(storages: List[Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for obj in storages:
+        address = getattr(obj, 'address', None)
+        storage_id = None
+        if isinstance(address, (list, tuple)) and address:
+            storage_id = address[0]
+        if storage_id is None:
+            storage_id = getattr(obj, 'id', None) or 'storage'
         rows.append(
             {
-                'id': obj.address[0],
+                'id': str(storage_id),
                 'soc': safe_float(getattr(getattr(obj, 'charge', None), 'now', 0.0), 0.0),
             }
         )
@@ -188,18 +195,18 @@ def choose_storage_targets(total_capacity: float, future: List[Dict[str, float]]
     head_deficit = sum(max(0.0, -value) for value in future_balances[:2])
     tail_deficit = sum(max(0.0, -value) for value in future_balances[2:4])
     all_surplus = sum(max(0.0, value) for value in future_balances[:4])
-    floor_soc = total_capacity * 0.10 + 0.18 * head_deficit
-    floor_soc = clamp(floor_soc, total_capacity * MIN_FLOOR_FRAC, total_capacity * 0.28)
-    target_soc = total_capacity * 0.54
-    target_soc += 0.55 * head_deficit
-    target_soc += 0.18 * tail_deficit
-    target_soc -= 0.20 * all_surplus
-    target_soc = clamp(target_soc, floor_soc, total_capacity * 0.85)
+    floor_soc = total_capacity * 0.08 + 0.14 * head_deficit
+    floor_soc = clamp(floor_soc, total_capacity * 0.06, total_capacity * 0.24)
+    target_soc = total_capacity * 0.52
+    target_soc += 0.65 * head_deficit
+    target_soc += 0.25 * tail_deficit
+    target_soc -= 0.18 * all_surplus
+    target_soc = clamp(target_soc, floor_soc, total_capacity * 0.88)
     if tick >= game_length - 2 * ENDGAME_TICKS:
-        target_soc = min(target_soc, total_capacity * 0.45)
+        target_soc = min(target_soc, total_capacity * 0.40)
     if tick >= game_length - ENDGAME_TICKS:
-        floor_soc = min(floor_soc, total_capacity * 0.03)
-        target_soc = min(target_soc, total_capacity * 0.15)
+        floor_soc = min(floor_soc, total_capacity * 0.02)
+        target_soc = min(target_soc, total_capacity * 0.10)
     return target_soc, floor_soc
 def market_reference(psm: Any, cfg: Dict[str, Any]) -> Dict[str, float]:
     floor = max(2.0, safe_float(cfg.get('exchangeExternalSell', 2.0), 2.0))
@@ -260,13 +267,7 @@ def distribute_charge(storages: List[Dict[str, Any]], charge_total: float, per_c
             orders.append((storage['id'], amount))
             remaining -= amount
     return orders
-def distribute_discharge(
-    storages: List[Dict[str, Any]],
-    discharge_total: float,
-    per_cell_limit: float,
-    floor_soc: float,
-    cell_capacity: float,
-) -> List[Tuple[str, float]]:
+def distribute_discharge(storages: List[Dict[str, Any]], discharge_total: float, per_cell_limit: float, floor_soc: float, cell_capacity: float) -> List[Tuple[str, float]]:
     orders: List[Tuple[str, float]] = []
     remaining = discharge_total
     per_cell_floor = clamp(floor_soc / max(1, len(storages)), 0.0, cell_capacity)
@@ -326,10 +327,15 @@ def decide_storage_actions(
     discharge_total = 0.0
     market_discharge = 0.0
     # При дефиците энергия из накопителя идет в сеть до аварийного резерва.
-    if current_deficit > BALANCE_BUFFER and discharge_cap > 0.0:
-        desired = current_deficit + 0.30 * head_deficit
+    if current_deficit > DEFICIT_DISCHARGE_THRESHOLD and discharge_cap > 0.0:
+        desired = current_deficit + 0.45 * head_deficit
         discharge_total = min(total_discharge_rate, discharge_cap, desired)
         mode = 'discharge'
+    elif current_deficit > 0.0 and discharge_cap > 0.0 and total_soc > target_soc + total_capacity * TARGET_MARGIN_FRAC:
+        desired = min(current_deficit, 0.35 * total_discharge_rate)
+        discharge_total = min(total_discharge_rate, discharge_cap, desired)
+        if discharge_total >= MIN_ORDER_VOLUME:
+            mode = 'discharge'
     elif current_surplus > BALANCE_BUFFER and charge_cap > 0.0:
         charge_gap = max(0.0, target_soc - total_soc)
         reserveable_surplus = current_surplus
@@ -345,6 +351,7 @@ def decide_storage_actions(
         mode != 'charge'
         and current_surplus > BALANCE_BUFFER
         and extra_soc >= MIN_ORDER_VOLUME
+        and head_deficit <= 1.5
         and (hot_market or total_soc >= 0.90 * total_capacity)
         and price_ctx['reference'] >= price_ctx['strong_price']
     )
@@ -378,14 +385,12 @@ def decide_storage_actions(
         'hot_market': hot_market,
         'excellent_market': excellent_market,
     }
-def build_sell_ladder(
-    balance_now: Dict[str, float],
-    storage_plan: Dict[str, Any],
-    future: List[Dict[str, float]],
-    price_ctx: Dict[str, float],
-    anti_dump_limit: float,
-) -> List[Tuple[float, float]]:
+def build_sell_ladder(balance_now: Dict[str, float], storage_plan: Dict[str, Any], future: List[Dict[str, float]], price_ctx: Dict[str, float], anti_dump_limit: float) -> List[Tuple[float, float]]:
     current_surplus = max(0.0, balance_now['balance'])
+    if anti_dump_limit <= 0.0:
+        return []
+    if storage_plan['total_capacity'] > 0.0 and storage_plan['total_soc'] + 0.25 < storage_plan['target_soc']:
+        return []
     immediate_sellable = max(0.0, current_surplus - storage_plan['charge_total'])
     sellable = min(immediate_sellable + max(0.0, storage_plan['market_discharge']), max(0.0, anti_dump_limit))
     future_balances = [row['balance'] for row in future]
@@ -458,11 +463,8 @@ def controller(psm: Any) -> Dict[str, Any]:
     return {
         'tick': int(getattr(psm, 'tick', 0)),
         'physical_balance_now': round(balance_now['balance'], 6),
-        'future_balances': [round(row['balance'], 6) for row in future],
         'market_ref': round(price_ctx['reference'], 6),
         'anti_dump_limit': round(anti_dump_limit, 6),
-        'strong_price': round(price_ctx['strong_price'], 6),
-        'excellent_price': round(price_ctx['excellent_price'], 6),
         'storage_mode': storage_plan['mode'],
         'total_soc': round(storage_plan['total_soc'], 6),
         'target_soc': round(storage_plan['target_soc'], 6),
@@ -470,10 +472,6 @@ def controller(psm: Any) -> Dict[str, Any]:
         'charge_total': round(storage_plan['charge_total'], 6),
         'discharge_total': round(storage_plan['discharge_total'], 6),
         'market_discharge': round(storage_plan['market_discharge'], 6),
-        'hot_market': storage_plan['hot_market'],
-        'excellent_market': storage_plan['excellent_market'],
-        'charge_orders': storage_plan['charge_orders'],
-        'discharge_orders': storage_plan['discharge_orders'],
         'sell_orders': ladder,
     }
 def main() -> None:
