@@ -626,11 +626,6 @@ def get_score_breakdown(psm: Any) -> Tuple[float, float, Optional[float]]:
     return safe_float(parsed.get('income', 0.0), 0.0), safe_float(parsed.get('loss', 0.0), 0.0), safe_float(total_score, None)
 
 
-def get_score_delta(psm: Any) -> float:
-    income, loss, _ = get_score_breakdown(psm)
-    return income - loss
-
-
 def get_total_score(psm: Any) -> Optional[float]:
     _, _, total = get_score_breakdown(psm)
     return total
@@ -866,7 +861,6 @@ def default_state() -> Dict[str, Any]:
         'load_mix': {'counts': {}, 'houseb_share': 0.0},
         'object_models': {},
         'storage_mode': 'hold',
-        'storage_mode_lock_until': -1,
         'weather_history': {'wind': [], 'sun': []},
         'loss_model': dict(LOSS_MODEL_PRIOR, scale=1.0),
     }
@@ -1238,7 +1232,6 @@ def apply_post_tick_learning(
     weather: Dict[str, float],
     bundle: Dict[str, Dict[str, Any]],
     tick: int,
-    cfg: Optional[Dict[str, Any]] = None,
     total_consumed: Optional[float] = None,
     total_losses: Optional[float] = None,
     marketable_useful_now: Optional[float] = None,
@@ -1337,20 +1330,6 @@ def apply_post_tick_learning(
             model['samples'] = safe_int(model.get('samples', 0), 0) + 1
 
 
-def update_models(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weather: Dict[str, float], bundle: Dict[str, Dict[str, Any]], tick: int, cfg: Optional[Dict[str, Any]] = None, total_consumed: Optional[float] = None, total_losses: Optional[float] = None) -> None:
-    refresh_static_runtime_context(state, object_rows)
-    apply_post_tick_learning(
-        state,
-        object_rows,
-        weather,
-        bundle,
-        tick,
-        cfg=cfg,
-        total_consumed=total_consumed,
-        total_losses=total_losses,
-    )
-
-
 def analyze_exchange(exchange_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     def weighted_avg(num: float, den: float) -> Optional[float]:
         return None if den <= 1e-9 else num / den
@@ -1408,7 +1387,7 @@ def update_market_history(state: Dict[str, Any], tick: int, market_stats: Dict[s
     return history
 
 
-def build_market_context(state: Dict[str, Any], market_stats: Dict[str, Any]) -> Dict[str, Any]:
+def build_market_context(state: Dict[str, Any]) -> Dict[str, Any]:
     history = list(state.get('market_history', []))
     fill_samples = [safe_float(row.get('fill_ratio', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > 0.25]
     ask_samples = [safe_float(row.get('avg_ask_price', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > 0.25]
@@ -1445,7 +1424,7 @@ def build_market_context(state: Dict[str, Any], market_stats: Dict[str, Any]) ->
     }
 
 
-def compute_useful_energy(total_generated: float, total_consumed: float, total_losses: float) -> float:
+def compute_useful_energy(total_generated: float, total_losses: float) -> float:
     return total_generated - total_losses
 
 
@@ -1716,7 +1695,7 @@ def forecast_profile_context(profile: Dict[str, Any], tick: int, horizon: int = 
     }
 
 
-def compute_target_soc(cfg: Dict[str, Any], total_capacity: float, total_soc: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> float:
+def compute_target_soc(total_capacity: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> float:
     base_ceil = min(total_capacity, total_capacity * SOC_CEIL_FRAC)
     weighted_gap = 0.0
     weighted_surplus = 0.0
@@ -1795,12 +1774,13 @@ def compute_target_soc(cfg: Dict[str, Any], total_capacity: float, total_soc: fl
     return clamp(target, floor, base_ceil)
 
 
-def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_now: float, useful_now: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], Dict[str, Any]]:
+def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_now: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], Dict[str, Any]]:
     if not storages:
         return [], [], {
             'target_soc': 0.0,
             'prep_soc': 0.0,
             'total_soc': 0.0,
+            'soc_ceil': 0.0,
             'charge_total': 0.0,
             'discharge_total': 0.0,
             'discharge_for_market': 0.0,
@@ -1814,6 +1794,10 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
             'mode': 'hold',
             'signal': 0.0,
             'protected_soc': 0.0,
+            'premium_sell_ready': False,
+            'fill_to_ceiling': False,
+            'deficit_relief_floor_soc': 0.0,
+            'deficit_relief_cap': 0.0,
         }
     cell_capacity = safe_float(cfg['cellCapacity'], 120.0)
     charge_rate = safe_float(cfg['cellChargeRate'], 15.0)
@@ -1827,13 +1811,12 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     total_charge_rate = len(norm_storages) * charge_rate
     total_discharge_rate = len(norm_storages) * discharge_rate
     soc_ceil = min(total_capacity, total_capacity * SOC_CEIL_FRAC)
-    target_soc = compute_target_soc(cfg, total_capacity, total_soc, future, fill_ratio, tick, game_length, loss_ratio=loss_ratio, profile_ctx=profile_ctx, market_ctx=market_ctx)
+    target_soc = compute_target_soc(total_capacity, future, fill_ratio, tick, game_length, profile_ctx=profile_ctx, market_ctx=market_ctx)
     next_balance = safe_float(future[0].get('balance_pred', 0.0), 0.0) if future else 0.0
     next2_balance = safe_float(future[1].get('balance_pred', next_balance), next_balance) if len(future) > 1 else next_balance
     signal = 0.55 * balance_now + 0.30 * next_balance + 0.15 * next2_balance
     deficit_sum = sum(max(0.0, -safe_float(r.get('balance_pred', 0.0), 0.0)) for r in future)
     surplus_sum = sum(max(0.0, safe_float(r.get('balance_pred', 0.0), 0.0)) for r in future)
-    next_deficit = max(0.0, -safe_float(future[0].get('balance_pred', 0.0), 0.0)) if future else 0.0
     chronic_deficit = deficit_sum > max(4.0, 1.5 * surplus_sum)
     floor_frac = 0.06 if chronic_deficit else SOC_FLOOR_FRAC
     if tick >= game_length - ENDGAME_TICKS:
@@ -1857,9 +1840,14 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     has_fill_history = bool(market_ctx.get('has_fill_history', False)) if market_ctx else False
     weak_fill_ratio = safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78)
     good_fill_ratio = safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.92), 0.92)
+    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 5.0), 5.0)
     weak_market_fill = has_fill_history and recent_fill < weak_fill_ratio
     market_sell_support = recent_fill >= good_fill_ratio if has_fill_history else price_realism >= 0.82
     anti_dump_headroom = safe_float(market_ctx.get('anti_dump_headroom', 0.0), 0.0) if market_ctx else 0.0
+    recent_ask_price = safe_float(
+        market_ctx.get('recent_ask_price', state.get('market_ref', 4.8)),
+        safe_float(state.get('market_ref', 4.8), 4.8),
+    ) if market_ctx else safe_float(state.get('market_ref', 4.8), 4.8)
     emergency_floor_soc = max(floor_soc, total_capacity * (0.12 if severe_risk else 0.08 if chronic_deficit else 0.05))
     working_floor_soc = max(emergency_floor_soc, total_capacity * (0.18 if weak_market_fill or price_realism < 0.65 else 0.12))
     prep_soc = target_soc
@@ -1889,11 +1877,30 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     )
     discharge_cap = max(0.0, total_soc - discharge_floor_soc)
     market_soc_floor = max(protected_soc + 0.02 * total_capacity, prep_soc + (0.04 if tick >= game_length - 2 else 0.06) * total_capacity)
-    prev_mode = str(state.get('storage_mode', 'hold'))
-    locked = tick <= safe_int(state.get('storage_mode_lock_until', -1), -1)
     force_discharge = balance_now < -4.0 and total_soc > discharge_floor_soc + 0.08 * total_capacity
     force_charge = total_soc < floor_soc + 0.06 * total_capacity and balance_now >= 0.0
     startup_mode_now = startup_active(state, tick)
+    premium_sell_ready = bool(
+        market_sell_support
+        and price_realism >= 0.92
+        and recent_ask_price >= preferred_ask_high
+        and (not has_fill_history or not weak_market_fill)
+        and not overpriced_market
+        and anti_dump_headroom >= MIN_ORDER_VOLUME
+    )
+    full_charge_gap_trigger = max(MIN_ORDER_VOLUME, 0.01 * total_capacity)
+    fill_to_ceiling = (
+        current_surplus >= MIN_ORDER_VOLUME
+        and charge_room > full_charge_gap_trigger
+        and not premium_sell_ready
+        and not force_discharge
+    )
+    deficit_relief_floor_soc = max(floor_soc, emergency_floor_soc)
+    deficit_relief_cap = max(0.0, total_soc - deficit_relief_floor_soc)
+    urgent_deficit_discharge = (
+        current_deficit >= MIN_ORDER_VOLUME
+        and deficit_relief_cap >= MIN_ORDER_VOLUME
+    )
     recharge_gap_trigger = 0.03 * total_capacity
     topoff_gap_trigger = max(MIN_ORDER_VOLUME, 0.006 * total_capacity)
     # Future deficits can make `signal` negative even when there is a surplus right now.
@@ -1918,24 +1925,33 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     desired_mode = 'hold'
     if force_discharge:
         desired_mode = 'discharge'
+    elif urgent_deficit_discharge:
+        desired_mode = 'discharge'
     elif force_charge:
         desired_mode = 'charge'
     elif opportunistic_recharge:
         desired_mode = 'charge'
     elif topoff_recharge:
         desired_mode = 'charge'
+    elif fill_to_ceiling:
+        desired_mode = 'charge'
     elif total_soc > discharge_floor_soc + 0.05 * total_capacity and signal < -2.0:
         desired_mode = 'discharge'
-    mode = prev_mode if locked and not (force_discharge or force_charge or opportunistic_recharge or topoff_recharge) else desired_mode
-    if mode != prev_mode:
-        state['storage_mode_lock_until'] = tick + 2
+    mode = desired_mode
     state['storage_mode'] = mode
-    if mode == 'charge' and charge_room > 0.0 and charge_cap > 0.0 and current_surplus > 0.0:
-        charge_limit = charge_cap
-        if topoff_recharge and not opportunistic_recharge and not force_charge:
+    if mode == 'charge' and charge_room > 0.0 and current_surplus > 0.0:
+        charge_limit = charge_room if fill_to_ceiling else charge_cap
+        if topoff_recharge and not opportunistic_recharge and not force_charge and not fill_to_ceiling:
             charge_limit = min(charge_limit, storage_gap)
-        charge_total = min(total_charge_rate, charge_room, charge_limit, current_surplus)
-    if mode == 'discharge' and discharge_cap > 0.0:
+        if charge_limit > 0.0:
+            charge_total = min(total_charge_rate, charge_room, charge_limit, current_surplus)
+    effective_discharge_cap = discharge_cap
+    if force_discharge or urgent_deficit_discharge:
+        effective_discharge_cap = max(effective_discharge_cap, deficit_relief_cap)
+    order_discharge_floor_soc = discharge_floor_soc
+    if force_discharge or urgent_deficit_discharge:
+        order_discharge_floor_soc = min(order_discharge_floor_soc, deficit_relief_floor_soc)
+    if mode == 'discharge' and effective_discharge_cap > 0.0:
         desired = current_deficit + 0.25 * max(0.0, -next_balance)
         if chronic_deficit or current_profile.get('protect_bias', 0.0) > 0.5:
             desired += 0.10 * deficit_sum
@@ -1943,7 +1959,9 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
             desired *= 0.78
         if force_discharge:
             desired = max(desired, current_deficit + 0.50 * max(0.0, -next_balance))
-        discharge_total = min(total_discharge_rate, discharge_cap, max(0.0, desired))
+        if urgent_deficit_discharge:
+            desired = max(desired, current_deficit)
+        discharge_total = min(total_discharge_rate, effective_discharge_cap, max(0.0, desired))
     allow_market_discharge = (
         tick >= game_length - ENDGAME_TICKS
         and total_soc > market_soc_floor
@@ -1958,6 +1976,23 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         and not overpriced_market
         and anti_dump_headroom >= MIN_ORDER_VOLUME
     )
+    premium_market_window = (
+        total_soc >= soc_ceil - max(0.04 * total_capacity, total_discharge_rate)
+        and total_soc > market_soc_floor
+        and current_deficit < MIN_ORDER_VOLUME
+        and signal >= -0.4
+        and not severe_risk
+        and loss_ratio < 0.26
+        and current_profile.get('protect_bias', 0.0) <= 0.35
+        and (next_risk_in is None or next_risk_in > 5)
+        and market_sell_support
+        and price_realism >= 0.90
+        and recent_ask_price >= preferred_ask_high
+        and not weak_market_fill
+        and not overpriced_market
+        and anti_dump_headroom >= MIN_ORDER_VOLUME
+    )
+    allow_market_discharge = allow_market_discharge or premium_market_window
     if allow_market_discharge and mode != 'charge':
         extra = min(max(0.0, total_discharge_rate - discharge_total), max(0.0, discharge_cap - discharge_total))
         market_headroom = max(0.0, total_soc - market_soc_floor)
@@ -1976,7 +2011,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
             charge_orders.append((s['id'], round_vol(amt)))
             rem -= amt
     rem = discharge_total
-    floor_per_cell = discharge_floor_soc / max(1, len(norm_storages))
+    floor_per_cell = order_discharge_floor_soc / max(1, len(norm_storages))
     for s in sorted(norm_storages, key=lambda x: -x['soc']):
         if rem <= 1e-9:
             break
@@ -1992,6 +2027,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         'target_soc': target_soc,
         'prep_soc': prep_soc,
         'total_soc': total_soc,
+        'soc_ceil': soc_ceil,
         'charge_total': charge_total,
         'discharge_total': discharge_total,
         'discharge_for_market': discharge_for_market,
@@ -2006,6 +2042,14 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         'signal': signal,
         'protected_soc': protected_soc,
         'discharge_floor_soc': discharge_floor_soc,
+        'order_discharge_floor_soc': order_discharge_floor_soc,
+        'urgent_deficit_discharge': urgent_deficit_discharge,
+        'premium_sell_ready': premium_sell_ready,
+        'fill_to_ceiling': fill_to_ceiling,
+        'deficit_relief_floor_soc': deficit_relief_floor_soc,
+        'deficit_relief_cap': deficit_relief_cap,
+        'premium_market_window': premium_market_window,
+        'recent_ask_price': recent_ask_price,
     }
 
 
@@ -2313,7 +2357,7 @@ def analyze_topology(object_rows: List[Dict[str, Any]], network_rows: List[Dict[
     }
 
 
-def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_rows: List[Dict[str, Any]], network_losses: float, useful_supply_now: float, profile_ctx: Optional[Dict[str, Any]] = None) -> float:
+def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_rows: List[Dict[str, Any]], useful_supply_now: float, profile_ctx: Optional[Dict[str, Any]] = None) -> float:
     gen_total = sum(r['generated'] for r in object_rows)
     wind_gen = sum(r['generated'] for r in object_rows if r['type'] == 'wind')
     wind_share = wind_gen / max(gen_total, 1e-9) if gen_total > 0 else 0.0
@@ -2546,7 +2590,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     future = forecast_window(state, object_rows, forecast_bundle, tick, game_length, LOOKAHEAD)
     current_theoretical = current_theoretical_metrics(state, object_rows, weather, forecast_bundle, tick, cfg)
 
-    useful_raw = compute_useful_energy(total_generated, total_consumed, total_losses)
+    useful_raw = compute_useful_energy(total_generated, total_losses)
     useful_now = max(0.0, useful_raw)
     balance_now = compute_balance_energy(total_generated, total_consumed, total_losses)
 
@@ -2567,7 +2611,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     if fill_ratio_now is not None:
         state['fill_ratio_ewma'] = 0.76 * safe_float(state.get('fill_ratio_ewma', 0.84), 0.84) + 0.24 * fill_ratio_now
     update_market_history(state, tick, market_stats)
-    market_ctx = build_market_context(state, market_stats)
+    market_ctx = build_market_context(state)
     anti_dump_cap_preview = compute_offer_cap(state, cfg, tick, useful_now)
     market_ctx['anti_dump_cap'] = anti_dump_cap_preview
     market_ctx['anti_dump_headroom'] = max(0.0, anti_dump_cap_preview - safe_float(state.get('last_sell_volume', 0.0), 0.0))
@@ -2575,7 +2619,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     decision_abs_err = safe_float(state.get('abs_err_ewma', 1.2), 1.2)
 
     charge_orders, discharge_orders, battery_dbg = storage_policy(
-        state, cfg, obj_agg['storages'], balance_now, useful_now, future,
+        state, cfg, obj_agg['storages'], balance_now, future,
         safe_float(market_ctx.get('recent_fill_ratio', state.get('fill_ratio_ewma', 0.84)), 0.84), tick, game_length,
         loss_ratio=decision_loss_ratio,
         profile_ctx=profile_ctx,
@@ -2583,7 +2627,8 @@ def controller(psm: Any) -> Dict[str, Any]:
     )
     startup_mode = startup_active(state, tick)
     stable_surplus_now = max(0.0, balance_now)
-    gross_marketable_useful_now = max(0.0, balance_now + battery_dbg['discharge_for_market'] - battery_dbg['charge_total'])
+    surplus_after_storage = max(0.0, stable_surplus_now - battery_dbg['charge_total'])
+    gross_marketable_useful_now = max(0.0, surplus_after_storage + battery_dbg['discharge_for_market'])
     stress_sell_mode = bool(
         balance_now < 0.0
         or decision_loss_ratio > 0.30
@@ -2591,31 +2636,55 @@ def controller(psm: Any) -> Dict[str, Any]:
         or 'high_network_losses' in topology.get('warnings', [])
     )
     marketable_useful_now = gross_marketable_useful_now
-    if battery_dbg.get('mode') == 'charge':
-        marketable_useful_now = min(marketable_useful_now, max(0.0, stable_surplus_now - battery_dbg['charge_total']))
-    else:
-        marketable_useful_now = min(marketable_useful_now, stable_surplus_now + battery_dbg['discharge_for_market'])
     if stress_sell_mode:
         marketable_useful_now = min(
             marketable_useful_now,
             max(0.0, balance_now + battery_dbg['discharge_for_market'] - battery_dbg['charge_total']),
         )
     offer_cap = compute_offer_cap(state, cfg, tick, marketable_useful_now)
-    reserve = compute_reserve(state, future, object_rows, total_losses, marketable_useful_now, profile_ctx=profile_ctx)
+    reserve = compute_reserve(state, future, object_rows, marketable_useful_now, profile_ctx=profile_ctx)
     market_ctx['anti_dump_cap'] = offer_cap
     market_ctx['anti_dump_headroom'] = max(0.0, offer_cap - safe_float(state.get('last_sell_volume', 0.0), 0.0))
     sell_volume = compute_safe_sell_volume(state, object_rows, marketable_useful_now, offer_cap, reserve, balance_now, topology, market_ctx)
     storage_sell_guard_gap = max(MIN_ORDER_VOLUME, 0.006 * len(obj_agg['storages']) * safe_float(cfg['cellCapacity'], 120.0))
-    storage_gap_after_orders = max(
+    premium_sell_ready = bool(battery_dbg.get('premium_sell_ready', False))
+    physical_storage_room_after_orders = max(
         0.0,
-        safe_float(battery_dbg.get('prep_soc', battery_dbg['target_soc']), battery_dbg['target_soc'])
+        safe_float(battery_dbg.get('soc_ceil', 0.0), 0.0)
         - (safe_float(battery_dbg.get('total_soc', 0.0), 0.0) + safe_float(battery_dbg.get('charge_total', 0.0), 0.0)),
     )
-    if sell_volume > 0.0 and stable_surplus_now >= MIN_ORDER_VOLUME and storage_gap_after_orders > storage_sell_guard_gap and battery_dbg.get('charge_total', 0.0) <= 0.0:
+    storage_is_nearly_full = physical_storage_room_after_orders <= storage_sell_guard_gap
+    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 5.0), 5.0)
+    recent_ask_price = safe_float(
+        market_ctx.get('recent_ask_price', state.get('market_ref', 4.8)),
+        safe_float(state.get('market_ref', 4.8), 4.8),
+    )
+    hot_price_sell_ready = bool(
+        premium_sell_ready
+        or (
+            safe_float(market_ctx.get('price_realism', 1.0), 1.0) >= 0.94
+            and recent_ask_price >= preferred_ask_high
+        )
+    )
+    sell_blocked_for_storage = bool(
+        stable_surplus_now >= MIN_ORDER_VOLUME
+        and physical_storage_room_after_orders > storage_sell_guard_gap
+        and battery_dbg.get('charge_total', 0.0) <= 0.0
+        and not hot_price_sell_ready
+    )
+    if sell_volume > 0.0 and sell_blocked_for_storage:
         sell_volume = 0.0
+    fallback_sell_ready = bool(
+        (
+            market_ctx.get('good_fill')
+            and safe_float(market_ctx.get('price_realism', 1.0), 1.0) >= 0.85
+        )
+        or storage_is_nearly_full
+        or hot_price_sell_ready
+    )
     if startup_mode and battery_dbg.get('signal', 0.0) <= reserve + 0.5:
         sell_volume = 0.0
-    elif marketable_useful_now >= MIN_ORDER_VOLUME and sell_volume <= 0.0 and market_ctx.get('good_fill') and safe_float(market_ctx.get('price_realism', 1.0), 1.0) >= 0.85:
+    elif marketable_useful_now >= MIN_ORDER_VOLUME and sell_volume <= 0.0 and fallback_sell_ready and not sell_blocked_for_storage:
         sell_volume = round_vol(min(offer_cap, marketable_useful_now, max(MIN_ORDER_VOLUME, 0.48 * marketable_useful_now)))
 
     storage_excess = battery_dbg['total_soc'] > battery_dbg.get('prep_soc', battery_dbg['target_soc']) + 0.08 * len(obj_agg['storages']) * safe_float(cfg['cellCapacity'], 120.0)
@@ -2767,7 +2836,6 @@ def controller(psm: Any) -> Dict[str, Any]:
         weather,
         forecast_bundle,
         tick,
-        cfg=cfg,
         total_consumed=total_consumed,
         total_losses=total_losses,
         marketable_useful_now=marketable_useful_now,
