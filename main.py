@@ -1879,6 +1879,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     discharge_for_market = 0.0
     current_deficit = max(0.0, -balance_now)
     current_surplus = max(0.0, balance_now)
+    storage_gap = max(0.0, prep_soc - total_soc)
     charge_room = max(0.0, total_capacity * SOC_CEIL_FRAC - total_soc)
     charge_cap = max(0.0, prep_soc + 0.02 * total_capacity - total_soc)
     discharge_floor_soc = clamp(
@@ -1892,15 +1893,27 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     locked = tick <= safe_int(state.get('storage_mode_lock_until', -1), -1)
     force_discharge = balance_now < -4.0 and total_soc > discharge_floor_soc + 0.08 * total_capacity
     force_charge = total_soc < floor_soc + 0.06 * total_capacity and balance_now >= 0.0
+    startup_mode_now = startup_active(state, tick)
     recharge_gap_trigger = 0.03 * total_capacity
+    topoff_gap_trigger = max(MIN_ORDER_VOLUME, 0.006 * total_capacity)
     # Future deficits can make `signal` negative even when there is a surplus right now.
     # In that case we still want to capture the current excess if the battery is clearly
     # below the preparation target, otherwise the surplus is left for market selling.
     opportunistic_recharge = (
-        total_soc < prep_soc - recharge_gap_trigger
+        storage_gap > recharge_gap_trigger
         and current_surplus >= MIN_ORDER_VOLUME
         and charge_room > 0.0
         and charge_cap > 0.0
+    )
+    # When we are only slightly below the prep target, still prefer topping up on a real
+    # surplus instead of silently holding or selling away that energy.
+    topoff_recharge = (
+        storage_gap > topoff_gap_trigger
+        and current_surplus >= MIN_ORDER_VOLUME
+        and charge_room > 0.0
+        and charge_cap > 0.0
+        and not force_discharge
+        and (startup_mode_now or signal >= -0.75)
     )
     desired_mode = 'hold'
     if force_discharge:
@@ -1909,14 +1922,19 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         desired_mode = 'charge'
     elif opportunistic_recharge:
         desired_mode = 'charge'
+    elif topoff_recharge:
+        desired_mode = 'charge'
     elif total_soc > discharge_floor_soc + 0.05 * total_capacity and signal < -2.0:
         desired_mode = 'discharge'
-    mode = prev_mode if locked and not (force_discharge or force_charge or opportunistic_recharge) else desired_mode
+    mode = prev_mode if locked and not (force_discharge or force_charge or opportunistic_recharge or topoff_recharge) else desired_mode
     if mode != prev_mode:
         state['storage_mode_lock_until'] = tick + 2
     state['storage_mode'] = mode
     if mode == 'charge' and charge_room > 0.0 and charge_cap > 0.0 and current_surplus > 0.0:
-        charge_total = min(total_charge_rate, charge_room, charge_cap, current_surplus)
+        charge_limit = charge_cap
+        if topoff_recharge and not opportunistic_recharge and not force_charge:
+            charge_limit = min(charge_limit, storage_gap)
+        charge_total = min(total_charge_rate, charge_room, charge_limit, current_surplus)
     if mode == 'discharge' and discharge_cap > 0.0:
         desired = current_deficit + 0.25 * max(0.0, -next_balance)
         if chronic_deficit or current_profile.get('protect_bias', 0.0) > 0.5:
@@ -2587,6 +2605,14 @@ def controller(psm: Any) -> Dict[str, Any]:
     market_ctx['anti_dump_cap'] = offer_cap
     market_ctx['anti_dump_headroom'] = max(0.0, offer_cap - safe_float(state.get('last_sell_volume', 0.0), 0.0))
     sell_volume = compute_safe_sell_volume(state, object_rows, marketable_useful_now, offer_cap, reserve, balance_now, topology, market_ctx)
+    storage_sell_guard_gap = max(MIN_ORDER_VOLUME, 0.006 * len(obj_agg['storages']) * safe_float(cfg['cellCapacity'], 120.0))
+    storage_gap_after_orders = max(
+        0.0,
+        safe_float(battery_dbg.get('prep_soc', battery_dbg['target_soc']), battery_dbg['target_soc'])
+        - (safe_float(battery_dbg.get('total_soc', 0.0), 0.0) + safe_float(battery_dbg.get('charge_total', 0.0), 0.0)),
+    )
+    if sell_volume > 0.0 and stable_surplus_now >= MIN_ORDER_VOLUME and storage_gap_after_orders > storage_sell_guard_gap and battery_dbg.get('charge_total', 0.0) <= 0.0:
+        sell_volume = 0.0
     if startup_mode and battery_dbg.get('signal', 0.0) <= reserve + 0.5:
         sell_volume = 0.0
     elif marketable_useful_now >= MIN_ORDER_VOLUME and sell_volume <= 0.0 and market_ctx.get('good_fill') and safe_float(market_ctx.get('price_realism', 1.0), 1.0) >= 0.85:
