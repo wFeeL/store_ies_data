@@ -16,6 +16,7 @@ node_modules/
 vendor/
 
 # IDE
+__pycache__
 .vscode/
 .idea/
 *.swp
