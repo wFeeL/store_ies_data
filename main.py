@@ -862,6 +862,7 @@ def default_state() -> Dict[str, Any]:
         'startup_load_scale': 1.0,
         'startup_mode_until': -1,
         'startup_last_ratio': 1.0,
+        'startup_last_update_tick': -1,
         'load_mix': {'counts': {}, 'houseb_share': 0.0},
         'object_models': {},
         'storage_mode': 'hold',
@@ -1178,6 +1179,59 @@ def refresh_static_runtime_context(state: Dict[str, Any], object_rows: List[Dict
     }
 
 
+def apply_startup_observation(
+    state: Dict[str, Any],
+    object_rows: List[Dict[str, Any]],
+    bundle: Dict[str, Dict[str, Any]],
+    tick: int,
+    total_consumed: Optional[float] = None,
+) -> None:
+    if total_consumed is None:
+        return
+    if safe_int(state.get('startup_last_update_tick', -1), -1) == tick:
+        return
+
+    total_fc_now = aggregate_forecast_load(bundle, object_rows, tick)
+    prev_scale = clamp(safe_float(state.get('startup_load_scale', 1.0), 1.0), 0.0, 1.0)
+
+    if total_fc_now > 1e-6:
+        observed_ratio = clamp(total_consumed / max(total_fc_now, 1e-6), 0.0, 1.10)
+        state['startup_last_ratio'] = observed_ratio
+        if tick == 0 and observed_ratio < 0.15:
+            state['startup_mode_until'] = max(safe_int(state.get('startup_mode_until', -1), -1), 4)
+        elif tick == 1 and observed_ratio < 0.30:
+            state['startup_mode_until'] = max(safe_int(state.get('startup_mode_until', -1), -1), 4)
+
+        startup_now = startup_active(state, tick)
+        if startup_now:
+            scale_target = clamp(observed_ratio, 0.0, 1.0)
+            if tick <= 1 and observed_ratio < 0.35:
+                scale = clamp(0.18 * prev_scale + 0.82 * scale_target, 0.0, 1.0)
+                startup_cap = clamp(0.14 + 0.45 * observed_ratio, 0.14, 0.45)
+                state['startup_load_scale'] = min(scale, startup_cap)
+            else:
+                scale = clamp(0.35 * prev_scale + 0.65 * scale_target, 0.0, 1.0)
+                state['startup_load_scale'] = min(scale, prev_scale + 0.25)
+            if observed_ratio > 0.75:
+                state['startup_mode_until'] = tick - 1
+        elif prev_scale < 0.999:
+            scale_target = clamp(observed_ratio, 0.0, 1.0)
+            scale_alpha = 0.28 if scale_target >= prev_scale else 0.38
+            state['startup_load_scale'] = clamp((1.0 - scale_alpha) * prev_scale + scale_alpha * scale_target, 0.0, 1.0)
+
+        startup_bias_now = startup_bias_active(state, tick)
+        load_bias = total_consumed / max(total_fc_now, 1e-6)
+        load_bias = clamp(load_bias, 0.02 if startup_bias_now else 0.28, 1.10)
+        alpha = 0.35 if startup_bias_now else 0.10
+        state['load_bias_total'] = (1.0 - alpha) * safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) + alpha * load_bias
+        pred_total = safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) * total_fc_now
+        state['load_abs_err'] = 0.90 * safe_float(state.get('load_abs_err', 2.0), 2.0) + 0.10 * abs(total_consumed - pred_total)
+    elif prev_scale < 0.999 and tick > safe_int(state.get('startup_mode_until', -1), -1):
+        state['startup_load_scale'] = min(1.0, clamp(prev_scale + 0.18, 0.0, 1.0))
+
+    state['startup_last_update_tick'] = tick
+
+
 def apply_post_tick_learning(
     state: Dict[str, Any],
     object_rows: List[Dict[str, Any]],
@@ -1195,33 +1249,13 @@ def apply_post_tick_learning(
     hist = state.setdefault('weather_history', {'wind': [], 'sun': []})
     hist['wind'] = (hist.get('wind') or [])[-12:] + [wind_now]
     hist['sun'] = (hist.get('sun') or [])[-12:] + [sun_now]
-    total_fc_now = aggregate_forecast_load(bundle, object_rows, tick)
-    observed_ratio = safe_float(state.get('startup_last_ratio', 1.0), 1.0)
-    if total_consumed is not None and total_fc_now > 1e-6:
-        prev_scale = clamp(safe_float(state.get('startup_load_scale', 1.0), 1.0), 0.0, 1.0)
-        observed_ratio = clamp(total_consumed / max(total_fc_now, 1e-6), 0.0, 1.10)
-        state['startup_last_ratio'] = observed_ratio
-        if tick == 0 and observed_ratio < 0.15:
-            state['startup_mode_until'] = 3
-        startup_now = startup_active(state, tick)
-        if startup_now:
-            scale = clamp(0.35 * prev_scale + 0.65 * min(1.0, observed_ratio), 0.0, 1.0)
-            state['startup_load_scale'] = min(scale, prev_scale + 0.25)
-            if observed_ratio > 0.75:
-                state['startup_mode_until'] = tick - 1
-        elif prev_scale < 0.999:
-            scale_target = clamp(observed_ratio, 0.0, 1.0)
-            scale_alpha = 0.28 if scale_target >= prev_scale else 0.38
-            state['startup_load_scale'] = clamp((1.0 - scale_alpha) * prev_scale + scale_alpha * scale_target, 0.0, 1.0)
-        startup_bias_now = startup_bias_active(state, tick)
-        load_bias = total_consumed / max(total_fc_now, 1e-6)
-        load_bias = clamp(load_bias, 0.02 if startup_bias_now else 0.28, 1.10)
-        alpha = 0.35 if startup_bias_now else 0.10
-        state['load_bias_total'] = (1.0 - alpha) * safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) + alpha * load_bias
-        pred_total = safe_float(state.get('load_bias_total', LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR) * total_fc_now
-        state['load_abs_err'] = 0.90 * safe_float(state.get('load_abs_err', 2.0), 2.0) + 0.10 * abs(total_consumed - pred_total)
-    elif safe_float(state.get('startup_load_scale', 1.0), 1.0) < 0.999 and tick > safe_int(state.get('startup_mode_until', -1), -1):
-        state['startup_load_scale'] = min(1.0, clamp(safe_float(state.get('startup_load_scale', 1.0), 1.0) + 0.18, 0.0, 1.0))
+    apply_startup_observation(
+        state,
+        object_rows,
+        bundle,
+        tick,
+        total_consumed=total_consumed,
+    )
 
     if total_consumed is not None and total_losses is not None:
         pred_loss = predict_total_losses(state, sum(r['generated'] for r in object_rows), total_consumed)
@@ -1847,11 +1881,16 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     current_surplus = max(0.0, balance_now)
     charge_room = max(0.0, total_capacity * SOC_CEIL_FRAC - total_soc)
     charge_cap = max(0.0, prep_soc + 0.02 * total_capacity - total_soc)
-    discharge_cap = max(0.0, total_soc - (protected_soc + 0.02 * total_capacity))
+    discharge_floor_soc = clamp(
+        max(protected_soc + 0.02 * total_capacity, prep_soc - 0.02 * total_capacity),
+        floor_soc,
+        soc_ceil,
+    )
+    discharge_cap = max(0.0, total_soc - discharge_floor_soc)
     market_soc_floor = max(protected_soc + 0.02 * total_capacity, prep_soc + (0.04 if tick >= game_length - 2 else 0.06) * total_capacity)
     prev_mode = str(state.get('storage_mode', 'hold'))
     locked = tick <= safe_int(state.get('storage_mode_lock_until', -1), -1)
-    force_discharge = balance_now < -4.0 and total_soc > protected_soc + 0.10 * total_capacity
+    force_discharge = balance_now < -4.0 and total_soc > discharge_floor_soc + 0.08 * total_capacity
     force_charge = total_soc < floor_soc + 0.06 * total_capacity and balance_now >= 0.0
     desired_mode = 'hold'
     if force_discharge:
@@ -1860,7 +1899,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         desired_mode = 'charge'
     elif total_soc < prep_soc - 0.05 * total_capacity and (signal > 2.0 or (next_risk_in is not None and next_risk_in <= 12 and next_balance > 1.0)):
         desired_mode = 'charge'
-    elif total_soc > protected_soc + 0.05 * total_capacity and signal < -2.0:
+    elif total_soc > discharge_floor_soc + 0.05 * total_capacity and signal < -2.0:
         desired_mode = 'discharge'
     mode = prev_mode if locked and not (force_discharge or force_charge) else desired_mode
     if mode != prev_mode:
@@ -1909,7 +1948,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
             charge_orders.append((s['id'], round_vol(amt)))
             rem -= amt
     rem = discharge_total
-    floor_per_cell = (protected_soc + 0.02 * total_capacity) / max(1, len(norm_storages))
+    floor_per_cell = discharge_floor_soc / max(1, len(norm_storages))
     for s in sorted(norm_storages, key=lambda x: -x['soc']):
         if rem <= 1e-9:
             break
@@ -1938,6 +1977,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         'mode': mode,
         'signal': signal,
         'protected_soc': protected_soc,
+        'discharge_floor_soc': discharge_floor_soc,
     }
 
 
@@ -2465,6 +2505,13 @@ def controller(psm: Any) -> Dict[str, Any]:
     state['cfg_runtime'] = cfg
     state['weather_runtime'] = weather
     refresh_static_runtime_context(state, object_rows)
+    apply_startup_observation(
+        state,
+        object_rows,
+        forecast_bundle,
+        tick,
+        total_consumed=total_consumed,
+    )
 
     forecast_profile = build_forecast_profile(state, forecast_bundle, object_rows, game_length)
     profile_ctx = forecast_profile_context(forecast_profile, tick, horizon=max(12, LOOKAHEAD * 2))
