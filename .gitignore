@@ -37,3 +37,6 @@ build/
 # Custom directories
 games/
 zip_games/
+game*/
+ips3-sandbox/
+short_main_state.json
