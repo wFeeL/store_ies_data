@@ -1913,7 +1913,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         and charge_room > 0.0
         and charge_cap > 0.0
         and not force_discharge
-        and (startup_mode_now or signal >= -0.75)
+        and (startup_mode_now or signal >= -1.5)
     )
     desired_mode = 'hold'
     if force_discharge:
