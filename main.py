@@ -1892,16 +1892,26 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     locked = tick <= safe_int(state.get('storage_mode_lock_until', -1), -1)
     force_discharge = balance_now < -4.0 and total_soc > discharge_floor_soc + 0.08 * total_capacity
     force_charge = total_soc < floor_soc + 0.06 * total_capacity and balance_now >= 0.0
+    recharge_gap_trigger = 0.03 * total_capacity
+    # Future deficits can make `signal` negative even when there is a surplus right now.
+    # In that case we still want to capture the current excess if the battery is clearly
+    # below the preparation target, otherwise the surplus is left for market selling.
+    opportunistic_recharge = (
+        total_soc < prep_soc - recharge_gap_trigger
+        and current_surplus >= MIN_ORDER_VOLUME
+        and charge_room > 0.0
+        and charge_cap > 0.0
+    )
     desired_mode = 'hold'
     if force_discharge:
         desired_mode = 'discharge'
     elif force_charge:
         desired_mode = 'charge'
-    elif total_soc < prep_soc - 0.05 * total_capacity and (signal > 2.0 or (next_risk_in is not None and next_risk_in <= 12 and next_balance > 1.0)):
+    elif opportunistic_recharge:
         desired_mode = 'charge'
     elif total_soc > discharge_floor_soc + 0.05 * total_capacity and signal < -2.0:
         desired_mode = 'discharge'
-    mode = prev_mode if locked and not (force_discharge or force_charge) else desired_mode
+    mode = prev_mode if locked and not (force_discharge or force_charge or opportunistic_recharge) else desired_mode
     if mode != prev_mode:
         state['storage_mode_lock_until'] = tick + 2
     state['storage_mode'] = mode
