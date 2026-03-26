@@ -1,8 +1,6 @@
 import csv
 import json
 import os
-import sys
-import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import ips
@@ -15,13 +13,21 @@ MARKET_INSIGHTS = {
     'good_fill_ratio': 0.88,
     'weak_fill_ratio': 0.72,
     'bad_fill_ratio': 0.58,
-    'preferred_ask_low': 2.8,
-    'preferred_ask_high': 5.0,
-    'overpriced_ask': 7.2,
+    'preferred_ask_low': 8.2,
+    'preferred_ask_high': 9.2,
+    'overpriced_ask': 9.8,
+    'poor_execution_ratio': 0.35,
+    'good_execution_ratio': 0.72,
+    'execution_price_floor': 8.4,
+    'execution_price_cap': 9.4,
+    'high_volume_soft_cap': 8.0,
+    'market_log_window': 12,
+    'market_log_ewma_alpha': 0.34,
+    'near_zero_fill_ratio': 0.12,
+    'overpriced_gap_steps': 1.1,
+    'underpriced_gap_steps': 1.6,
 }
 
-# Softened empirical priors: still keep relative ordering from archive games,
-# but stay closer to neutral because object estimates are not yet fully trusted.
 PRODUCER_INSIGHTS = {
     's1': {'strength': 1.00, 'stability': 0.66, 'storm_risk': 0.00},
     's7': {'strength': 1.02, 'stability': 0.64, 'storm_risk': 0.00},
@@ -33,9 +39,6 @@ PRODUCER_INSIGHTS = {
 }
 
 STATE_FILE = os.path.expanduser('~/ips3-sandbox/ies_state.json')
-LOG_DIR = os.path.expanduser('~/ips3-sandbox/ies_logs')
-TICK_SUMMARY_FILE = os.path.join(LOG_DIR, 'tick_summary.jsonl')
-STRATEGY_DEBUG_FILE = os.path.join(LOG_DIR, 'strategy_debug.jsonl')
 
 MIN_ORDER_VOLUME = 0.25
 MIN_RESERVE = 0.8
@@ -123,25 +126,17 @@ FORECAST_HEADER_TO_KEY = {
 FORECAST_SERIES_ORDER = ('hospital', 'factory', 'office', 'houseA', 'houseB', 'sun', 'wind')
 _FORECAST_CACHE: Dict[str, Any] = {'key': None, 'payload': None}
 
-
-# =====================
-# Generic helpers
-# =====================
-
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-
 def round_vol(x: float) -> float:
     return round(max(0.0, float(x)), 3)
-
 
 def round_price(x: float, price_max: float = 20.0, price_step: float = 0.2) -> float:
     step = max(0.01, float(price_step))
     hi = clamp(float(price_max), MARKET_PRICE_MIN, MARKET_PRICE_MAX)
     x = clamp(float(x), MARKET_PRICE_MIN, hi)
     return round(round(x / step) * step, 2)
-
 
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -151,7 +146,6 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except Exception:
         return None if default is None else float(default)
 
-
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -160,12 +154,10 @@ def safe_int(value: Any, default: int = 0) -> int:
     except Exception:
         return int(default)
 
-
 def avg(values: List[float], default: float = 0.0) -> float:
     if not values:
         return float(default)
     return sum(float(v) for v in values) / float(len(values))
-
 
 def addr_to_str(address: Any) -> str:
     if isinstance(address, list):
@@ -174,72 +166,10 @@ def addr_to_str(address: Any) -> str:
         return '|'.join(str(x) for x in address)
     return str(address)
 
-
-_NONCRITICAL_IO_GUARD = False
-
-
-def _report_noncritical_io_error(op: str, path: str, exc: Exception) -> None:
-    global _NONCRITICAL_IO_GUARD
-    payload = {
-        'kind': 'noncritical_io_error',
-        'op': op,
-        'path': path,
-        'error': f'{type(exc).__name__}: {exc}',
-    }
-    try:
-        print(f"[noncritical-io] {op} {path}: {exc}", file=sys.stderr)
-    except Exception:
-        pass
-    if _NONCRITICAL_IO_GUARD or os.path.abspath(path) == os.path.abspath(STRATEGY_DEBUG_FILE):
-        return
-    _NONCRITICAL_IO_GUARD = True
-    try:
-        os.makedirs(os.path.dirname(STRATEGY_DEBUG_FILE), exist_ok=True)
-        with open(STRATEGY_DEBUG_FILE, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + '\n')
-    except Exception:
-        pass
-    finally:
-        _NONCRITICAL_IO_GUARD = False
-
-
-def ensure_dir(path: str) -> None:
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception as exc:
-        _report_noncritical_io_error('mkdir', path, exc)
-
-
-def write_jsonl(path: str, row: Dict[str, Any]) -> None:
-    try:
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(row, ensure_ascii=False) + '\n')
-    except Exception as exc:
-        _report_noncritical_io_error('write_jsonl', path, exc)
-
-
-def reset_runtime_outputs() -> None:
-    ensure_dir(LOG_DIR)
-    for path in [
-        TICK_SUMMARY_FILE,
-        STRATEGY_DEBUG_FILE,
-    ]:
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as exc:
-            _report_noncritical_io_error('remove', path, exc)
-
-
-# =====================
-# Forecast helpers
-# =====================
-
 def normalize_forecast_header(name: Any) -> str:
     s = str(name or '').strip().lower().replace('ё', 'е').replace('_', ' ').replace('-', ' ')
     s = ' '.join(s.split())
     return FORECAST_HEADER_TO_KEY.get(s, '')
-
 
 def _parse_forecast_csv(path: str) -> Optional[Dict[str, Any]]:
     series = {name: [] for name in FORECAST_SERIES_ORDER}
@@ -281,7 +211,6 @@ def _parse_forecast_csv(path: str) -> Optional[Dict[str, Any]]:
         },
     }
 
-
 def find_external_forecast_file() -> Optional[str]:
     preferred = [DEFAULT_FORECAST_FILE]
     for path in preferred:
@@ -303,7 +232,6 @@ def find_external_forecast_file() -> Optional[str]:
         return None
     return None
 
-
 def load_external_forecast_csv() -> Optional[Dict[str, Any]]:
     path = find_external_forecast_file()
     if not path:
@@ -321,7 +249,6 @@ def load_external_forecast_csv() -> Optional[Dict[str, Any]]:
     _FORECAST_CACHE['key'] = cache_key
     _FORECAST_CACHE['payload'] = payload
     return payload
-
 
 def corridor_fallback_value(cfg: Optional[Dict[str, Any]], name: str) -> float:
     cfg = cfg or {}
@@ -347,7 +274,6 @@ def corridor_fallback_value(cfg: Optional[Dict[str, Any]], name: str) -> float:
     default = default_map.get(name, 0.5)
     return safe_float(cfg.get(key, default), default) if key else default
 
-
 def forecast_required_series(object_rows: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     required = ['sun', 'wind']
     if not object_rows:
@@ -357,7 +283,6 @@ def forecast_required_series(object_rows: Optional[List[Dict[str, Any]]] = None)
         if fc_name and fc_name not in required:
             required.append(fc_name)
     return required
-
 
 def forecast_validated_rows(bundle: Dict[str, Dict[str, Any]], game_length: int) -> int:
     meta = bundle.get('_meta', {})
@@ -371,14 +296,12 @@ def forecast_validated_rows(bundle: Dict[str, Dict[str, Any]], game_length: int)
         return min(max(GAME_TICKS, game_length), min(lengths))
     return 0
 
-
 def forecast_has_valid_tick(bundle: Dict[str, Dict[str, Any]], tick: int) -> bool:
     if tick < 0:
         return False
     meta = bundle.get('_meta', {})
     required_rows = safe_int(meta.get('required_rows', GAME_TICKS), GAME_TICKS)
     return tick < forecast_validated_rows(bundle, required_rows)
-
 
 def _extract_forecast_series(item: Any) -> Tuple[List[float], Optional[float]]:
     if item is None:
@@ -397,7 +320,6 @@ def _extract_forecast_series(item: Any) -> Tuple[List[float], Optional[float]]:
         return [safe_float(v, 0.0) for v in item], spread
     except Exception:
         return [], None
-
 
 def load_native_forecast_bundle(psm: Any) -> Dict[str, Dict[str, Any]]:
     raw = psm.get('forecasts') if isinstance(psm, dict) else getattr(psm, 'forecasts', None)
@@ -426,7 +348,6 @@ def load_native_forecast_bundle(psm: Any) -> Dict[str, Dict[str, Any]]:
         'series_lengths': {name: len(item.get('data', [])) for name, item in out.items() if isinstance(item, dict) and 'data' in item},
     }
     return out
-
 
 def harmonize_forecast_bundle(
     external: Optional[Dict[str, Any]],
@@ -496,20 +417,13 @@ def harmonize_forecast_bundle(
     }
     return out
 
-
-# =====================
-# Access layer for live psm objects and compact JSON snapshots
-# =====================
-
 def is_compact_object(obj: Any) -> bool:
     return isinstance(obj, list)
-
 
 def get_tick(psm: Any) -> int:
     if isinstance(psm, dict):
         return safe_int(psm.get('tick', 0))
     return safe_int(getattr(psm, 'tick', 0))
-
 
 def get_game_length(psm: Any) -> int:
     if isinstance(psm, dict):
@@ -517,119 +431,6 @@ def get_game_length(psm: Any) -> int:
     else:
         value = safe_int(getattr(psm, 'gameLength', GAME_TICKS), GAME_TICKS)
     return value if value > 0 else GAME_TICKS
-
-
-def get_raw_score_delta(psm: Any) -> Any:
-    return psm.get('scoreDelta') if isinstance(psm, dict) else getattr(psm, 'scoreDelta', None)
-
-
-def _extract_explicit_total_score(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    direct = safe_float(value, None)
-    if direct is not None:
-        return direct
-    if isinstance(value, dict):
-        for key in ('total_score', 'totalScore', 'score_total', 'scoreTotal', 'total'):
-            if key in value:
-                total = safe_float(value.get(key), None)
-                if total is not None:
-                    return total
-        return None
-    for key in ('total_score', 'totalScore', 'score_total', 'scoreTotal', 'total'):
-        total = safe_float(getattr(value, key, None), None)
-        if total is not None:
-            return total
-    return None
-
-
-def parse_score_breakdown(raw: Any) -> Dict[str, Any]:
-    result = {
-        'income': 0.0,
-        'loss': 0.0,
-        'total_score': None,
-        'score_delta': 0.0,
-        'format': 'missing',
-        'ambiguous': False,
-    }
-    if raw is None:
-        return result
-    if isinstance(raw, dict):
-        income = safe_float(raw.get('income', None), None)
-        loss = safe_float(raw.get('loss', None), None)
-        if income is not None or loss is not None:
-            result['format'] = 'object'
-            result['income'] = safe_float(income, 0.0)
-            result['loss'] = safe_float(loss, 0.0)
-            result['total_score'] = _extract_explicit_total_score(raw)
-            result['score_delta'] = result['income'] - result['loss']
-            return result
-    income = safe_float(getattr(raw, 'income', None), None)
-    loss = safe_float(getattr(raw, 'loss', None), None)
-    if income is not None or loss is not None:
-        result['format'] = 'object'
-        result['income'] = safe_float(income, 0.0)
-        result['loss'] = safe_float(loss, 0.0)
-        result['total_score'] = _extract_explicit_total_score(raw)
-        result['score_delta'] = result['income'] - result['loss']
-        return result
-    if isinstance(raw, (list, tuple)):
-        if len(raw) == 2:
-            result['format'] = 'list_receipt'
-            result['income'] = safe_float(raw[0], 0.0)
-            result['loss'] = safe_float(raw[1], 0.0)
-        else:
-            result['format'] = 'list_ambiguous'
-            result['ambiguous'] = True
-            if raw:
-                income = safe_float(raw[0], None)
-                if income is not None:
-                    result['income'] = income
-            if len(raw) > 1:
-                loss = safe_float(raw[1], None)
-                if loss is not None:
-                    result['loss'] = loss
-        result['score_delta'] = result['income'] - result['loss']
-        return result
-    delta = safe_float(raw, None)
-    if delta is not None:
-        result['format'] = 'scalar'
-        result['income'] = delta
-        result['score_delta'] = delta
-        return result
-    result['format'] = type(raw).__name__
-    result['ambiguous'] = True
-    return result
-
-
-def _extract_total_score_from_psm(psm: Any) -> Optional[float]:
-    keys = ('total_score', 'totalScore', 'score_total', 'scoreTotal')
-    if isinstance(psm, dict):
-        for key in keys:
-            if key in psm:
-                total = _extract_explicit_total_score(psm.get(key))
-                if total is not None:
-                    return total
-        return None
-    for key in keys:
-        total = _extract_explicit_total_score(getattr(psm, key, None))
-        if total is not None:
-            return total
-    return None
-
-
-def get_score_breakdown(psm: Any) -> Tuple[float, float, Optional[float]]:
-    parsed = parse_score_breakdown(get_raw_score_delta(psm))
-    total_score = parsed.get('total_score')
-    if total_score is None:
-        total_score = _extract_total_score_from_psm(psm)
-    return safe_float(parsed.get('income', 0.0), 0.0), safe_float(parsed.get('loss', 0.0), 0.0), safe_float(total_score, None)
-
-
-def get_total_score(psm: Any) -> Optional[float]:
-    _, _, total = get_score_breakdown(psm)
-    return total
-
 
 def get_total_power_tuple(psm: Any) -> Tuple[float, float, float, float]:
     raw = psm.get('total_power') if isinstance(psm, dict) else getattr(psm, 'total_power', None)
@@ -647,13 +448,11 @@ def get_total_power_tuple(psm: Any) -> Tuple[float, float, float, float]:
         safe_float(getattr(raw, 'losses', 0.0), 0.0),
     )
 
-
 def get_weather_now(psm: Any, name: str) -> float:
     raw = psm.get(name) if isinstance(psm, dict) else getattr(psm, name, None)
     if isinstance(raw, list):
         return safe_float(raw[0], 0.0)
     return safe_float(getattr(raw, 'now', 0.0), 0.0)
-
 
 def get_forecast_bundle(
     psm: Any,
@@ -665,29 +464,24 @@ def get_forecast_bundle(
     native = load_native_forecast_bundle(psm)
     return harmonize_forecast_bundle(ext, native, max(GAME_TICKS, game_length), cfg=cfg, object_rows=object_rows)
 
-
 def get_object_list(psm: Any) -> List[Any]:
     if isinstance(psm, dict):
         return list(psm.get('objects', []))
     return list(getattr(psm, 'objects', []))
 
-
 def get_network_items(psm: Any) -> List[Tuple[str, Any]]:
     raw = psm.get('networks') if isinstance(psm, dict) else getattr(psm, 'networks', {})
     return list(raw.items())
-
 
 def get_exchange_list(psm: Any) -> List[Any]:
     if isinstance(psm, dict):
         return list(psm.get('exchange', []))
     return list(getattr(psm, 'exchange', []))
 
-
-def get_exchange_log(psm: Any) -> List[float]:
+def get_exchange_log(psm: Any) -> List[Any]:
     if isinstance(psm, dict):
         return list(psm.get('exchangeLog', []))
     return list(getattr(psm, 'exchangeLog', []))
-
 
 def get_config_dict(psm: Any) -> Dict[str, Any]:
     if isinstance(psm, dict):
@@ -710,40 +504,33 @@ def get_config_dict(psm: Any) -> Dict[str, Any]:
         out[key] = value
     return out
 
-
 def obj_id(obj: Any) -> Any:
     if is_compact_object(obj):
         return obj[0]
     return getattr(obj, 'id', None)
-
 
 def obj_type(obj: Any) -> str:
     if is_compact_object(obj):
         return str(obj[1])
     return str(getattr(obj, 'type', ''))
 
-
 def obj_contract(obj: Any) -> float:
     if is_compact_object(obj):
         return safe_float(obj[2], 0.0)
     return safe_float(getattr(obj, 'contract', 0.0), 0.0)
-
 
 def obj_address(obj: Any) -> List[str]:
     if is_compact_object(obj):
         return list(obj[3])
     return list(getattr(obj, 'address', []))
 
-
 def obj_address_key(obj: Any) -> str:
     return addr_to_str(obj_address(obj))
-
 
 def obj_path(obj: Any) -> Any:
     if is_compact_object(obj):
         return obj[4]
     return getattr(obj, 'path', [])
-
 
 def obj_score_now(obj: Any) -> Tuple[float, float]:
     if is_compact_object(obj):
@@ -752,14 +539,12 @@ def obj_score_now(obj: Any) -> Tuple[float, float]:
     score_now = getattr(getattr(obj, 'score', None), 'now', None)
     return safe_float(getattr(score_now, 'income', 0.0), 0.0), safe_float(getattr(score_now, 'loss', 0.0), 0.0)
 
-
 def obj_power_now(obj: Any) -> Tuple[float, float]:
     if is_compact_object(obj):
         raw = obj[8][0] if len(obj) > 8 and obj[8] else [0.0, 0.0]
         return safe_float(raw[0], 0.0), safe_float(raw[1], 0.0)
     power_now = getattr(getattr(obj, 'power', None), 'now', None)
     return safe_float(getattr(power_now, 'generated', 0.0), 0.0), safe_float(getattr(power_now, 'consumed', 0.0), 0.0)
-
 
 def obj_charge_now(obj: Any) -> Optional[float]:
     if is_compact_object(obj):
@@ -771,7 +556,6 @@ def obj_charge_now(obj: Any) -> Optional[float]:
         return None
     return safe_float(getattr(ch, 'now', 0.0), 0.0)
 
-
 def obj_wind_rotation_now(obj: Any) -> Optional[float]:
     if is_compact_object(obj):
         if len(obj) > 9 and isinstance(obj[9], list) and obj[9]:
@@ -782,7 +566,6 @@ def obj_wind_rotation_now(obj: Any) -> Optional[float]:
         return None
     return safe_float(getattr(wr, 'now', 0.0), 0.0)
 
-
 def obj_failed(obj: Any) -> int:
     if is_compact_object(obj):
         if len(obj) > 5:
@@ -790,30 +573,25 @@ def obj_failed(obj: Any) -> int:
         return 0
     return safe_int(getattr(obj, 'failed', 0), 0)
 
-
 def net_location(net: Any) -> Any:
     if isinstance(net, list):
         return net[0]
     return getattr(net, 'location', [])
-
 
 def net_upflow(net: Any) -> float:
     if isinstance(net, list):
         return safe_float(net[1], 0.0)
     return safe_float(getattr(net, 'upflow', 0.0), 0.0)
 
-
 def net_downflow(net: Any) -> float:
     if isinstance(net, list):
         return safe_float(net[2], 0.0)
     return safe_float(getattr(net, 'downflow', 0.0), 0.0)
 
-
 def net_losses(net: Any) -> float:
     if isinstance(net, list):
         return safe_float(net[3], 0.0)
     return safe_float(getattr(net, 'losses', 0.0), 0.0)
-
 
 def exchange_receipt_data(receipt: Any) -> Dict[str, float]:
     if isinstance(receipt, list):
@@ -837,11 +615,6 @@ def exchange_receipt_data(receipt: Any) -> Dict[str, float]:
     out['side'] = 'buy' if asked > 0 else ('sell' if asked < 0 else 'flat')
     return out
 
-
-# =====================
-# State
-# =====================
-
 def default_state() -> Dict[str, Any]:
     return {
         'prev_useful_supply_est': None,
@@ -850,7 +623,10 @@ def default_state() -> Dict[str, Any]:
         'abs_err_ewma': 1.2,
         'loss_ratio_ewma': 0.18,
         'fill_ratio_ewma': 0.84,
+        'execution_ratio_ewma': 0.72,
         'market_ref': 4.8,
+        'exchange_market_ref': 4.8,
+        'exchange_price_history': [],
         'market_history': [],
         'load_bias_total': LOAD_BIAS_PRIOR,
         'load_abs_err': 2.0,
@@ -865,7 +641,6 @@ def default_state() -> Dict[str, Any]:
         'loss_model': dict(LOSS_MODEL_PRIOR, scale=1.0),
     }
 
-
 def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
@@ -879,18 +654,15 @@ def load_state() -> Dict[str, Any]:
         pass
     return default_state()
 
-
 def save_state(state: Dict[str, Any]) -> None:
     try:
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        _report_noncritical_io_error('save_state', STATE_FILE, exc)
-
+    except Exception:
+        pass
 
 def _model_key(address: str, kind: str) -> str:
     return f'{kind}:{address}'
-
 
 def get_model(state: Dict[str, Any], key: str, kind: str) -> Dict[str, Any]:
     models = state.setdefault('object_models', {})
@@ -924,7 +696,6 @@ def get_model(state: Dict[str, Any], key: str, kind: str) -> Dict[str, Any]:
             models[mkey] = {'kind': kind, 'bias': None, 'err': 0.6, 'samples': 0}
     return models[mkey]
 
-
 def update_wind_rot_curve(model: Dict[str, Any], rotation_now: float, actual_power: float) -> None:
     if rotation_now <= 0.03 or actual_power < 0.0:
         return
@@ -937,7 +708,6 @@ def update_wind_rot_curve(model: Dict[str, Any], rotation_now: float, actual_pow
         keys = sorted(curve.keys(), key=lambda k: float(k))
         for old in keys[:-80]:
             curve.pop(old, None)
-
 
 def estimate_wind_from_curve(model: Dict[str, Any], rotation: float) -> Optional[float]:
     curve = model.get('rot_curve') or {}
@@ -964,11 +734,6 @@ def estimate_wind_from_curve(model: Dict[str, Any], rotation: float) -> Optional
         est = max(est, 0.92 * near_max)
     return max(0.0, est)
 
-
-# =====================
-# Analytics and logging
-# =====================
-
 def extract_object_rows(psm: Any) -> List[Dict[str, Any]]:
     rows = []
     for obj in get_object_list(psm):
@@ -990,7 +755,6 @@ def extract_object_rows(psm: Any) -> List[Dict[str, Any]]:
         })
     return rows
 
-
 def extract_network_rows(psm: Any) -> List[Dict[str, Any]]:
     rows = []
     for idx, net in get_network_items(psm):
@@ -1002,7 +766,6 @@ def extract_network_rows(psm: Any) -> List[Dict[str, Any]]:
             'losses': net_losses(net),
         })
     return rows
-
 
 def aggregate_objects(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     info: Dict[str, Any] = {
@@ -1037,14 +800,12 @@ def aggregate_objects(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             info['storages'].append({'id': row['address'].split('|')[0], 'soc': safe_float(row['charge_now'], 0.0)})
     return info
 
-
 def aggregate_networks(rows: List[Dict[str, Any]]) -> Dict[str, float]:
     return {
         'upflow_total': sum(r['upflow'] for r in rows),
         'downflow_total': sum(r['downflow'] for r in rows),
         'losses_total': sum(r['losses'] for r in rows),
     }
-
 
 def count_forecast_objects(object_rows: List[Dict[str, Any]]) -> Dict[str, int]:
     counts = {k: 0 for k in OBJECT_TYPE_TO_FORECAST}
@@ -1054,14 +815,12 @@ def count_forecast_objects(object_rows: List[Dict[str, Any]]) -> Dict[str, int]:
             counts[typ] += 1
     return counts
 
-
 def aggregate_forecast_load(bundle: Dict[str, Dict[str, Any]], object_rows: List[Dict[str, Any]], tick: int) -> float:
     counts = count_forecast_objects(object_rows)
     total = 0.0
     for typ, fc_name in OBJECT_TYPE_TO_FORECAST.items():
         total += counts.get(typ, 0) * get_forecast_value(bundle, fc_name, tick)
     return total
-
 
 def predict_total_losses(state: Dict[str, Any], total_gen: float, total_load: float) -> float:
     model = state.setdefault('loss_model', dict(LOSS_MODEL_PRIOR))
@@ -1075,7 +834,6 @@ def predict_total_losses(state: Dict[str, Any], total_gen: float, total_load: fl
     pred = max(0.0, pred)
     return pred * clamp(scale, 0.6, 1.6)
 
-
 def get_forecast_value(bundle: Dict[str, Dict[str, Any]], name: str, tick: int) -> float:
     if not forecast_has_valid_tick(bundle, tick):
         return 0.0
@@ -1087,13 +845,11 @@ def get_forecast_value(bundle: Dict[str, Dict[str, Any]], name: str, tick: int) 
         return 0.0
     return safe_float(data[tick], 0.0)
 
-
 def get_forecast_spread(bundle: Dict[str, Dict[str, Any]], name: str, fallback: float = 0.0) -> float:
     item = bundle.get(name)
     if not item:
         return fallback
     return safe_float(item.get('spread', fallback), fallback)
-
 
 def get_type_load_prior(state: Dict[str, Any], obj_type: str) -> float:
     prior = safe_float(LOAD_TYPE_BIAS_PRIORS.get(obj_type, LOAD_BIAS_PRIOR), LOAD_BIAS_PRIOR)
@@ -1104,7 +860,6 @@ def get_type_load_prior(state: Dict[str, Any], obj_type: str) -> float:
         prior *= damp
     return clamp(prior, 0.20, 1.20)
 
-
 def get_type_load_bounds(state: Dict[str, Any], obj_type: str) -> Tuple[float, float]:
     lo, hi = LOAD_TYPE_BIAS_BOUNDS.get(obj_type, (0.20, 1.20))
     mix = state.get('load_mix', {})
@@ -1114,23 +869,18 @@ def get_type_load_bounds(state: Dict[str, Any], obj_type: str) -> Tuple[float, f
         hi = min(hi, 1.12 - 0.08 * over)
     return clamp(lo, 0.10, 2.00), clamp(max(lo, hi), lo, 2.00)
 
-
 def clamp_storage_soc(value: Any, cell_capacity: float) -> float:
     return clamp(safe_float(value, 0.0), 0.0, max(0.0, cell_capacity))
 
-
 def startup_active(state: Dict[str, Any], tick: int) -> bool:
     return 0 <= safe_int(state.get('startup_mode_until', -1), -1) and tick <= safe_int(state.get('startup_mode_until', -1), -1)
-
 
 def startup_scale(state: Dict[str, Any], tick: int) -> float:
     scale = clamp(safe_float(state.get('startup_load_scale', 1.0), 1.0), 0.0, 1.0)
     return scale if startup_active(state, tick) or scale < 0.999 else 1.0
 
-
 def startup_bias_active(state: Dict[str, Any], tick: int) -> bool:
     return startup_active(state, tick) or startup_scale(state, tick) < 0.995
-
 
 def blended_load_base_bias(state: Dict[str, Any], obj_type: str, tick: int, type_prior: Optional[float] = None) -> float:
     prior = get_type_load_prior(state, obj_type) if type_prior is None else safe_float(type_prior, get_type_load_prior(state, obj_type))
@@ -1140,7 +890,6 @@ def blended_load_base_bias(state: Dict[str, Any], obj_type: str, tick: int, type
     if scale < 0.999:
         prior_weight *= 0.25 + 0.75 * scale
     return clamp((1.0 - prior_weight) * total_bias + prior_weight * prior, 0.02, 1.20)
-
 
 def effective_load_trust(state: Dict[str, Any], model: Dict[str, Any], obj_type: str, tick: int) -> float:
     samples = safe_int(model.get('samples', 0), 0)
@@ -1154,14 +903,12 @@ def effective_load_trust(state: Dict[str, Any], model: Dict[str, Any], obj_type:
         trust = max(trust, 0.24 + 0.26 * (1.0 - scale))
     return clamp(trust, 0.14, 0.72)
 
-
 def effective_load_bounds(state: Dict[str, Any], obj_type: str, tick: int) -> Tuple[float, float]:
     lo, hi = get_type_load_bounds(state, obj_type)
     scale = startup_scale(state, tick)
     if scale < 0.999:
         lo = min(lo, 0.02 + 0.18 * scale)
     return lo, hi
-
 
 def refresh_static_runtime_context(state: Dict[str, Any], object_rows: List[Dict[str, Any]]) -> None:
     load_counts = count_forecast_objects(object_rows)
@@ -1171,7 +918,6 @@ def refresh_static_runtime_context(state: Dict[str, Any], object_rows: List[Dict
         'total_objects': total_load_objects,
         'houseb_share': load_counts.get('houseB', 0) / float(total_load_objects),
     }
-
 
 def apply_startup_observation(
     state: Dict[str, Any],
@@ -1224,7 +970,6 @@ def apply_startup_observation(
         state['startup_load_scale'] = min(1.0, clamp(prev_scale + 0.18, 0.0, 1.0))
 
     state['startup_last_update_tick'] = tick
-
 
 def apply_post_tick_learning(
     state: Dict[str, Any],
@@ -1329,7 +1074,6 @@ def apply_post_tick_learning(
             model['err'] = 0.92 * safe_float(model.get('err', 0.6), 0.6) + 0.08 * abs(actual - pred)
             model['samples'] = safe_int(model.get('samples', 0), 0) + 1
 
-
 def analyze_exchange(exchange_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     def weighted_avg(num: float, den: float) -> Optional[float]:
         return None if den <= 1e-9 else num / den
@@ -1371,8 +1115,86 @@ def analyze_exchange(exchange_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         'instant_abs_total': stats['buy']['instant'] + stats['sell']['instant'] + stats['flat']['instant'],
     }
 
+def _extract_exchange_log_price(raw: Any) -> Optional[float]:
+    price = safe_float(raw, None)
+    if price is not None and price > 0.0:
+        return price
+    if isinstance(raw, dict):
+        values = raw.values()
+    elif isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        values = (getattr(raw, key, None) for key in ('price', 'tariff', 'clearingPrice', 'marketPrice', 'value'))
+    for value in values:
+        price = safe_float(value, None)
+        if price is not None and price > 0.0:
+            return price
+    return None
 
-def update_market_history(state: Dict[str, Any], tick: int, market_stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+def extract_exchange_log_prices(exchange_log: List[Any], limit: int = 24) -> List[float]:
+    out: List[float] = []
+    for raw in reversed(list(exchange_log or [])):
+        price = _extract_exchange_log_price(raw)
+        if price is None or price <= 0.0:
+            continue
+        out.append(price)
+        if len(out) >= max(1, safe_int(limit, 24)):
+            break
+    out.reverse()
+    return out
+
+def summarize_market_prices(
+    prices: List[float],
+    fallback: float,
+    floor: float,
+    cap: float,
+    alpha: float = 0.34,
+) -> Dict[str, float]:
+    clipped: List[float] = []
+    for raw in prices:
+        price = safe_float(raw, None)
+        if price is not None and price > 0.0:
+            clipped.append(clamp(price, floor, cap))
+    if not clipped:
+        ref = clamp(fallback, floor, cap)
+        return {
+            'count': 0,
+            'last': ref,
+            'rolling': ref,
+            'conservative': ref,
+            'aggressive': ref,
+            'reference': ref,
+        }
+    last = clipped[-1]
+    sorted_prices = sorted(clipped)
+    mid = len(sorted_prices) // 2
+    if len(sorted_prices) % 2 == 1:
+        median = sorted_prices[mid]
+    else:
+        median = 0.5 * (sorted_prices[mid - 1] + sorted_prices[mid])
+    a = clamp(alpha, 0.05, 0.95)
+    ewma = clipped[0]
+    for price in clipped[1:]:
+        ewma = (1.0 - a) * ewma + a * price
+    rolling = 0.50 * ewma + 0.35 * median + 0.15 * last
+    conservative = min(last, median, ewma)
+    aggressive = max(last, median, ewma)
+    reference = clamp(rolling, floor, cap)
+    return {
+        'count': len(clipped),
+        'last': clamp(last, floor, cap),
+        'rolling': clamp(rolling, floor, cap),
+        'conservative': clamp(conservative, floor, cap),
+        'aggressive': clamp(aggressive, floor, cap),
+        'reference': reference,
+    }
+
+def update_market_history(
+    state: Dict[str, Any],
+    tick: int,
+    market_stats: Dict[str, Any],
+    execution_ratio: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     history = list(state.get('market_history', []))
     history.append({
         'tick': tick,
@@ -1381,56 +1203,165 @@ def update_market_history(state: Dict[str, Any], tick: int, market_stats: Dict[s
         'fill_ratio': safe_float(market_stats.get('sell_fill_ratio', 0.0), 0.0),
         'avg_ask_price': safe_float(market_stats.get('sell_avg_asked_price', 0.0), 0.0),
         'avg_contracted_price': safe_float(market_stats.get('sell_avg_contracted_price', 0.0), 0.0),
+        'execution_ratio': safe_float(execution_ratio, -1.0),
     })
     history = history[-MARKET_HISTORY_WINDOW:]
     state['market_history'] = history
     return history
 
-
 def build_market_context(state: Dict[str, Any]) -> Dict[str, Any]:
     history = list(state.get('market_history', []))
-    fill_samples = [safe_float(row.get('fill_ratio', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > 0.25]
-    ask_samples = [safe_float(row.get('avg_ask_price', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > 0.25]
+    cfg = state.get('cfg_runtime', {}) if isinstance(state.get('cfg_runtime', {}), dict) else {}
+    step = max(0.01, safe_float(cfg.get('exchangeConsumerPriceStep', 0.2), 0.2))
+    floor = clamp(
+        safe_float(cfg.get('exchangeExternalSell', MARKET_PRICE_MIN), MARKET_PRICE_MIN),
+        MARKET_PRICE_MIN,
+        MARKET_PRICE_MAX,
+    )
+    cap = clamp(
+        safe_float(cfg.get('exchangeExternalBuy', MARKET_PRICE_MAX), MARKET_PRICE_MAX),
+        floor + step,
+        MARKET_PRICE_MAX,
+    )
+    fallback_ref = clamp(
+        safe_float(state.get('market_ref', max(floor + step, cap - 2.0 * step)), max(floor + step, cap - 2.0 * step)),
+        floor + step,
+        cap,
+    )
+    market_log_window = max(4, safe_int(MARKET_INSIGHTS.get('market_log_window', 12), 12))
+    market_log_prices = [safe_float(v, None) for v in state.get('exchange_price_history', [])]
+    market_log_prices = [p for p in market_log_prices if p is not None and p > 0.0][-market_log_window:]
+    contracted_samples = [
+        safe_float(row.get('avg_contracted_price', 0.0), 0.0)
+        for row in history
+        if safe_float(row.get('avg_contracted_price', 0.0), 0.0) > 0.0
+    ]
+    market_samples = list(market_log_prices)
+    if len(market_samples) < max(3, market_log_window // 2):
+        market_samples.extend(contracted_samples[-max(1, market_log_window - len(market_samples)):])
+    # Рыночный reference: exchangeLog + фактические цены наших контрактов как fallback.
+    market_summary = summarize_market_prices(
+        market_samples[-market_log_window:],
+        fallback_ref,
+        floor + step,
+        cap,
+        alpha=safe_float(MARKET_INSIGHTS.get('market_log_ewma_alpha', 0.34), 0.34),
+    )
+    market_ref = safe_float(market_summary.get('reference', fallback_ref), fallback_ref)
+    fill_samples = [safe_float(row.get('fill_ratio', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > MIN_ORDER_VOLUME]
+    ask_samples = [safe_float(row.get('avg_ask_price', 0.0), 0.0) for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > MIN_ORDER_VOLUME]
+    execution_samples = [
+        safe_float(row.get('execution_ratio', -1.0), -1.0)
+        for row in history
+        if safe_float(row.get('execution_ratio', -1.0), -1.0) >= 0.0
+    ]
+    active_rows = [row for row in history if safe_float(row.get('sell_asked', 0.0), 0.0) > MIN_ORDER_VOLUME]
+    last_row = active_rows[-1] if active_rows else None
     has_fill_history = len(fill_samples) >= 2
-    has_ask_history = len(ask_samples) >= 2
+    has_ask_history = len(ask_samples) >= 1
+    has_execution_history = len(execution_samples) >= 2
     weak_fill_ratio = safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78)
     good_fill_ratio = safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.92), 0.92)
-    overpriced_ask = safe_float(MARKET_INSIGHTS.get('overpriced_ask', 6.2), 6.2)
-    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 4.6), 4.6)
+    bad_fill_ratio = safe_float(MARKET_INSIGHTS.get('bad_fill_ratio', 0.58), 0.58)
+    poor_execution_ratio = safe_float(MARKET_INSIGHTS.get('poor_execution_ratio', 0.35), 0.35)
+    good_execution_ratio = safe_float(MARKET_INSIGHTS.get('good_execution_ratio', 0.72), 0.72)
+    near_zero_fill_ratio = safe_float(MARKET_INSIGHTS.get('near_zero_fill_ratio', 0.12), 0.12)
+    over_gap = max(step, safe_float(MARKET_INSIGHTS.get('overpriced_gap_steps', 1.1), 1.1) * step)
+    under_gap = max(step, safe_float(MARKET_INSIGHTS.get('underpriced_gap_steps', 1.6), 1.6) * step)
     neutral_fill = clamp(
         max(safe_float(state.get('fill_ratio_ewma', 0.84), 0.84), weak_fill_ratio + 0.06),
         weak_fill_ratio + 0.06,
         good_fill_ratio,
     )
+    neutral_execution = clamp(
+        max(safe_float(state.get('execution_ratio_ewma', good_execution_ratio), good_execution_ratio), poor_execution_ratio + 0.06),
+        poor_execution_ratio + 0.06,
+        1.0,
+    )
     recent_fill = avg(fill_samples, default=neutral_fill)
-    recent_ask = avg(ask_samples, default=safe_float(state.get('market_ref', 4.8), 4.8))
+    recent_ask = avg(ask_samples, default=market_ref)
+    recent_execution = avg(execution_samples, default=neutral_execution)
+    last_ask = safe_float(last_row.get('avg_ask_price', recent_ask), recent_ask) if last_row else recent_ask
+    last_fill = safe_float(last_row.get('fill_ratio', recent_fill), recent_fill) if last_row else recent_fill
+
+    weak_execution = has_execution_history and recent_execution < poor_execution_ratio
+    ask_gap = recent_ask - market_ref
+    last_gap = last_ask - market_ref
+    near_zero_fill = bool(last_row) and (last_fill <= near_zero_fill_ratio or recent_fill <= near_zero_fill_ratio)
+    # Overpriced: выше рынка + слабый fill/execution. Underpriced: заметно ниже рынка при устойчивом fill.
+    overpriced = (
+        bool(last_row)
+        and last_gap >= over_gap
+        and (
+            last_fill < weak_fill_ratio
+            or recent_fill < weak_fill_ratio
+            or weak_execution
+            or near_zero_fill
+        )
+    )
+    underpriced = (
+        bool(last_row)
+        and not overpriced
+        and last_gap <= -under_gap
+        and (
+            last_fill >= good_fill_ratio
+            or (recent_fill >= good_fill_ratio and recent_execution >= poor_execution_ratio + 0.15)
+        )
+    )
+
     price_realism = 1.0
-    if has_ask_history and recent_ask > preferred_ask_high:
-        over = recent_ask - preferred_ask_high
-        span = max(0.8, overpriced_ask - preferred_ask_high)
-        price_realism = clamp(1.0 - over / span, 0.18, 1.0)
+    if has_ask_history and ask_gap > 0.0:
+        price_realism *= clamp(1.0 - ask_gap / max(3.0 * step, 1.2), 0.18, 1.0)
     if has_fill_history and recent_fill < weak_fill_ratio:
         price_realism *= clamp(0.65 + 0.55 * recent_fill / max(weak_fill_ratio, 1e-6), 0.22, 1.0)
-    overpriced = has_ask_history and has_fill_history and recent_ask >= overpriced_ask and recent_fill < weak_fill_ratio
+    if has_execution_history and recent_execution < poor_execution_ratio:
+        price_realism *= clamp(0.50 + 0.80 * recent_execution / max(poor_execution_ratio, 1e-6), 0.20, 1.0)
+    if near_zero_fill:
+        price_realism *= 0.58
+    if underpriced and recent_fill >= good_fill_ratio:
+        price_realism *= 1.06
+    price_realism = clamp(price_realism, 0.12, 1.0)
+
+    pricing_bias_steps = 0.0
+    if overpriced:
+        gap_steps = max(0.0, last_gap / max(step, 1e-6))
+        pricing_bias_steps -= clamp(0.8 + 0.45 * gap_steps, 0.8, 2.8)
+    if near_zero_fill:
+        pricing_bias_steps -= 1.0
+    if underpriced:
+        gap_steps = max(0.0, -last_gap / max(step, 1e-6))
+        pricing_bias_steps += clamp(0.25 + 0.25 * gap_steps, 0.25, 1.4)
+    if has_fill_history and not overpriced and recent_fill >= good_fill_ratio and ask_gap <= 0.4 * step:
+        pricing_bias_steps += 0.20
+    if has_fill_history and recent_fill < bad_fill_ratio:
+        pricing_bias_steps -= 0.50
+    pricing_bias_steps = clamp(pricing_bias_steps, -3.2, 1.8)
+
     return {
-        'history': history,
+        'market_ref': market_ref,
+        'market_rolling_ref': safe_float(market_summary.get('rolling', market_ref), market_ref),
+        'conservative_market_ref': safe_float(market_summary.get('conservative', market_ref), market_ref),
+        'aggressive_market_ref': safe_float(market_summary.get('aggressive', market_ref), market_ref),
+        'market_price_step': step,
         'recent_fill_ratio': recent_fill,
         'recent_ask_price': recent_ask,
+        'recent_execution_ratio': recent_execution,
         'price_realism': price_realism,
         'has_fill_history': has_fill_history,
+        'has_execution_history': has_execution_history,
         'good_fill': has_fill_history and recent_fill >= good_fill_ratio,
         'weak_fill': has_fill_history and recent_fill < weak_fill_ratio,
+        'near_zero_fill': near_zero_fill,
         'overpriced': overpriced,
+        'underpriced': underpriced,
+        'pricing_bias_steps': pricing_bias_steps,
     }
-
 
 def compute_useful_energy(total_generated: float, total_losses: float) -> float:
     return total_generated - total_losses
 
-
 def compute_balance_energy(total_generated: float, total_consumed: float, total_losses: float) -> float:
     return total_generated - total_consumed - total_losses
-
 
 def compute_offer_cap(state: Dict[str, Any], cfg: Dict[str, Any], tick: int, useful_supply_now: float) -> float:
     prev_useful = state.get('prev_useful_energy_actual')
@@ -1439,7 +1370,6 @@ def compute_offer_cap(state: Dict[str, Any], cfg: Dict[str, Any], tick: int, use
             return safe_float(cfg['exchangeAmountBuffer'], 10.0)
         return max(safe_float(cfg['exchangeAmountBuffer'], 10.0), useful_supply_now)
     return max(0.0, safe_float(prev_useful, 0.0)) * safe_float(cfg['exchangeAmountScaler'], 1.2) + safe_float(cfg['exchangeAmountBuffer'], 10.0)
-
 
 def predict_object_generation(state: Dict[str, Any], row: Dict[str, Any], fc_sun: float, fc_wind: float, sun_spread: float, wind_spread: float, cfg: Optional[Dict[str, Any]] = None, weather: Optional[Dict[str, Any]] = None, step_ahead: int = 1) -> float:
     key = row['address']
@@ -1489,7 +1419,6 @@ def predict_object_generation(state: Dict[str, Any], row: Dict[str, Any], fc_sun
         return clamp(pred, 0.0, max_wind_power)
     return 0.0
 
-
 def predict_object_load(state: Dict[str, Any], row: Dict[str, Any], forecast_value: float, tick: int) -> float:
     key = row['address']
     typ = row['type']
@@ -1504,7 +1433,6 @@ def predict_object_load(state: Dict[str, Any], row: Dict[str, Any], forecast_val
     trust = effective_load_trust(state, model, typ, tick)
     bias = trust * model_bias + (1.0 - trust) * base_bias
     return max(0.0, forecast_value * clamp(bias, lo, hi))
-
 
 def forecast_window(state: Dict[str, Any], object_rows: List[Dict[str, Any]], bundle: Dict[str, Dict[str, Any]], tick: int, game_length: int, horizon: int) -> List[Dict[str, Any]]:
     runtime_cfg = state.get('cfg_runtime', {})
@@ -1555,7 +1483,6 @@ def forecast_window(state: Dict[str, Any], object_rows: List[Dict[str, Any]], bu
         })
     return out
 
-
 def percentile(values: List[float], q: float) -> float:
     if not values:
         return 0.0
@@ -1568,7 +1495,6 @@ def percentile(values: List[float], q: float) -> float:
     hi = min(len(vals) - 1, lo + 1)
     frac = pos - lo
     return vals[lo] * (1.0 - frac) + vals[hi] * frac
-
 
 def contiguous_windows(flags: List[bool], min_len: int = 1) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
@@ -1583,7 +1509,6 @@ def contiguous_windows(flags: List[bool], min_len: int = 1) -> List[Tuple[int, i
     if start is not None and len(flags) - start >= min_len:
         out.append((start, len(flags) - 1))
     return out
-
 
 def build_forecast_profile(state: Dict[str, Any], bundle: Dict[str, Dict[str, Any]], object_rows: List[Dict[str, Any]], game_length: int) -> Dict[str, Any]:
     rows = min(game_length, forecast_validated_rows(bundle, game_length))
@@ -1658,7 +1583,6 @@ def build_forecast_profile(state: Dict[str, Any], bundle: Dict[str, Dict[str, An
     }
     return {'rows': rows, 'ticks': ticks, 'windows': windows}
 
-
 def forecast_profile_context(profile: Dict[str, Any], tick: int, horizon: int = 12) -> Dict[str, Any]:
     ticks = profile.get('ticks', []) if isinstance(profile, dict) else []
     if not ticks:
@@ -1693,7 +1617,6 @@ def forecast_profile_context(profile: Dict[str, Any], tick: int, horizon: int = 
         'next_risk_in': next_risk_in,
         'next_solar_in': next_solar_in,
     }
-
 
 def compute_target_soc(total_capacity: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> float:
     base_ceil = min(total_capacity, total_capacity * SOC_CEIL_FRAC)
@@ -1773,7 +1696,6 @@ def compute_target_soc(total_capacity: float, future: List[Dict[str, Any]], fill
         target = max(0.0, 0.10 * weighted_gap)
     return clamp(target, floor, base_ceil)
 
-
 def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Dict[str, Any]], balance_now: float, future: List[Dict[str, Any]], fill_ratio: float, tick: int, game_length: int, loss_ratio: float = 0.10, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], Dict[str, Any]]:
     if not storages:
         return [], [], {
@@ -1840,7 +1762,7 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     has_fill_history = bool(market_ctx.get('has_fill_history', False)) if market_ctx else False
     weak_fill_ratio = safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78)
     good_fill_ratio = safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.92), 0.92)
-    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 5.0), 5.0)
+    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 9.2), 9.2)
     weak_market_fill = has_fill_history and recent_fill < weak_fill_ratio
     market_sell_support = recent_fill >= good_fill_ratio if has_fill_history else price_realism >= 0.82
     anti_dump_headroom = safe_float(market_ctx.get('anti_dump_headroom', 0.0), 0.0) if market_ctx else 0.0
@@ -1903,17 +1825,12 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
     )
     recharge_gap_trigger = 0.03 * total_capacity
     topoff_gap_trigger = max(MIN_ORDER_VOLUME, 0.006 * total_capacity)
-    # Future deficits can make `signal` negative even when there is a surplus right now.
-    # In that case we still want to capture the current excess if the battery is clearly
-    # below the preparation target, otherwise the surplus is left for market selling.
     opportunistic_recharge = (
         storage_gap > recharge_gap_trigger
         and current_surplus >= MIN_ORDER_VOLUME
         and charge_room > 0.0
         and charge_cap > 0.0
     )
-    # When we are only slightly below the prep target, still prefer topping up on a real
-    # surplus instead of silently holding or selling away that energy.
     topoff_recharge = (
         storage_gap > topoff_gap_trigger
         and current_surplus >= MIN_ORDER_VOLUME
@@ -2051,7 +1968,6 @@ def storage_policy(state: Dict[str, Any], cfg: Dict[str, Any], storages: List[Di
         'premium_market_window': premium_market_window,
         'recent_ask_price': recent_ask_price,
     }
-
 
 def analyze_topology(object_rows: List[Dict[str, Any]], network_rows: List[Dict[str, Any]], total_generated: float) -> Dict[str, Any]:
     def _decode(value: Any) -> Any:
@@ -2356,7 +2272,6 @@ def analyze_topology(object_rows: List[Dict[str, Any]], network_rows: List[Dict[
         'avg_object_path_depth': avg(object_path_depths, default=0.0),
     }
 
-
 def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_rows: List[Dict[str, Any]], useful_supply_now: float, profile_ctx: Optional[Dict[str, Any]] = None) -> float:
     gen_total = sum(r['generated'] for r in object_rows)
     wind_gen = sum(r['generated'] for r in object_rows if r['type'] == 'wind')
@@ -2383,7 +2298,6 @@ def compute_reserve(state: Dict[str, Any], future: List[Dict[str, Any]], object_
         reserve = min(reserve, max(MIN_RESERVE, 0.18 * useful_supply_now))
     return max(MIN_RESERVE, reserve)
 
-
 def build_ladder(sell_volume: float, market_ref: float, fill_ratio: float, max_tickets: int, cfg: Dict[str, Any], buy_ref: Optional[float] = None, profile_ctx: Optional[Dict[str, Any]] = None, market_ctx: Optional[Dict[str, Any]] = None, startup_mode: bool = False, storage_excess: bool = False) -> List[Tuple[float, float]]:
     if sell_volume < MIN_ORDER_VOLUME:
         return []
@@ -2397,36 +2311,105 @@ def build_ladder(sell_volume: float, market_ref: float, fill_ratio: float, max_t
     avg_risk = safe_float(profile_ctx.get('avg_risk_12', 0.0), 0.0) if profile_ctx else 0.0
     price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0) if market_ctx else 1.0
     overpriced = bool(market_ctx.get('overpriced', False)) if market_ctx else False
-    has_fill_history = bool(market_ctx.get('has_fill_history', False)) if market_ctx else False
+    underpriced = bool(market_ctx.get('underpriced', False)) if market_ctx else False
+    near_zero_fill = bool(market_ctx.get('near_zero_fill', False)) if market_ctx else False
+    good_fill = bool(market_ctx.get('good_fill', False)) if market_ctx else False
     weak_fill = bool(market_ctx.get('weak_fill', False)) if market_ctx else fill_ratio < safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78)
-    base_ref = market_ref
-    if buy_ref is not None and has_fill_history and not weak_fill and not overpriced and price_realism >= 0.82:
-        buy_anchor = clamp(buy_ref, market_ref - 2.0 * step, market_ref + 1.5 * step)
-        base_ref = 0.85 * base_ref + 0.15 * buy_anchor
-    if fill_ratio < 0.55:
-        base_ref -= 1.2 * step
-    elif fill_ratio > 0.90:
-        base_ref += 1.0 * step
+    high_volume_soft_cap = safe_float(MARKET_INSIGHTS.get('high_volume_soft_cap', 8.0), 8.0)
+    bad_fill_ratio = safe_float(MARKET_INSIGHTS.get('bad_fill_ratio', 0.58), 0.58)
+    good_fill_ratio = safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.88), 0.88)
+    pricing_bias_steps = safe_float(market_ctx.get('pricing_bias_steps', 0.0), 0.0) if market_ctx else 0.0
+    anti_dump_cap = max(sell_volume, safe_float(market_ctx.get('anti_dump_cap', sell_volume), sell_volume), 1.0) if market_ctx else max(sell_volume, 1.0)
+    volume_share = clamp(sell_volume / anti_dump_cap, 0.0, 1.8)
+    volume_pressure = clamp((sell_volume - 0.55 * high_volume_soft_cap) / max(high_volume_soft_cap, 1.0), -0.5, 2.2)
+    market_anchor = safe_float(market_ctx.get('market_ref', market_ref), market_ref) if market_ctx else market_ref
+    conservative_ref = safe_float(market_ctx.get('conservative_market_ref', market_anchor), market_anchor) if market_ctx else market_anchor
+    aggressive_ref = safe_float(market_ctx.get('aggressive_market_ref', market_anchor), market_anchor) if market_ctx else market_anchor
+
+    base_ref = market_anchor
+    if buy_ref is not None and not weak_fill and not overpriced and price_realism >= 0.82:
+        buy_anchor = clamp(buy_ref, market_anchor - 2.0 * step, market_anchor + 1.2 * step)
+        base_ref = 0.90 * base_ref + 0.10 * buy_anchor
+    if fill_ratio < bad_fill_ratio:
+        base_ref -= 0.9 * step
+    elif fill_ratio > good_fill_ratio and not overpriced:
+        base_ref += 0.35 * step
     if current.get('mixed_peak') or avg_combo > avg_risk + 0.10:
-        base_ref += 0.8 * step
+        base_ref += 0.35 * step
     if current.get('protect_bias', 0.0) > 0.5 or avg_risk > avg_combo + 0.15:
-        base_ref -= 0.6 * step
-    if weak_fill or overpriced:
-        base_ref = min(base_ref, safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 4.6), 4.6))
-    if price_realism < 0.75:
-        base_ref = min(base_ref, safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 4.6), 4.6))
+        base_ref -= 0.40 * step
+    if startup_mode:
+        base_ref -= 0.40 * step
+    if storage_excess:
+        base_ref -= 0.30 * step
     base_ref = clamp(base_ref, MARKET_PRICE_MIN, market_cap)
 
-    if startup_mode or weak_fill:
-        prices = [max(MARKET_PRICE_MIN, gp_price + step, base_ref - step), min(base_ref + 2 * step, market_cap)]
-        shares = [0.85, 0.15]
-    elif storage_excess:
-        prices = [max(MARKET_PRICE_MIN, gp_price + step, base_ref - step), min(base_ref + 2 * step, market_cap), min(base_ref + 4 * step, market_cap)]
-        shares = [0.60, 0.25, 0.15]
+    bulk_delta = 0.35 - 1.05 * volume_pressure + pricing_bias_steps
+    # Чем больше объём, тем ближе bulk-транш к рынку; premium оставляем только для хвоста.
+    if weak_fill:
+        bulk_delta -= 0.65
+    if overpriced:
+        bulk_delta -= 0.75
+    if near_zero_fill:
+        bulk_delta -= 1.10
+    if underpriced and good_fill:
+        bulk_delta += 0.35
+    if volume_share > 0.95:
+        bulk_delta -= 0.45
+    bulk_up_cap = 1.6 if sell_volume <= 0.45 * high_volume_soft_cap else (0.9 if sell_volume <= high_volume_soft_cap else 0.2)
+    if weak_fill or overpriced:
+        bulk_up_cap = min(bulk_up_cap, 0.1)
+    bulk_delta = clamp(bulk_delta, -2.8, bulk_up_cap)
+    mid_delta = bulk_delta + (1.0 if sell_volume <= 0.8 * high_volume_soft_cap else 0.7)
+    tail_delta = mid_delta + (1.2 if sell_volume <= 0.55 * high_volume_soft_cap else 0.8)
+    if weak_fill or near_zero_fill:
+        mid_delta = min(mid_delta, bulk_delta + 0.7)
+        tail_delta = min(tail_delta, mid_delta + 0.7)
+    if underpriced and good_fill and sell_volume <= 0.45 * high_volume_soft_cap:
+        tail_delta += 0.4
+
+    floor_price = max(MARKET_PRICE_MIN, gp_price + step)
+    bulk_price = base_ref + bulk_delta * step
+    mid_price = base_ref + mid_delta * step
+    tail_price = base_ref + tail_delta * step
+    bulk_guard_high = aggressive_ref + (0.8 if sell_volume > high_volume_soft_cap else 1.4) * step
+    if weak_fill or overpriced:
+        bulk_guard_high = min(bulk_guard_high, conservative_ref + 0.6 * step)
+    bulk_price = clamp(bulk_price, floor_price, min(market_cap, bulk_guard_high))
+    mid_guard_high = aggressive_ref + (1.6 if sell_volume > high_volume_soft_cap else 2.4) * step
+    tail_guard_high = aggressive_ref + (2.2 if sell_volume <= 0.45 * high_volume_soft_cap else (1.6 if sell_volume <= high_volume_soft_cap else 1.2)) * step
+    if weak_fill or near_zero_fill:
+        mid_guard_high = min(mid_guard_high, aggressive_ref + 1.0 * step)
+        tail_guard_high = min(tail_guard_high, aggressive_ref + 1.4 * step)
+    mid_price = clamp(mid_price, min(market_cap, bulk_price + step), min(market_cap, max(bulk_price + step, mid_guard_high)))
+    tail_price = clamp(tail_price, min(market_cap, mid_price + step), min(market_cap, max(mid_price + step, tail_guard_high)))
+
+    if startup_mode:
+        prices = [bulk_price, mid_price]
+        shares = [0.90, 0.10]
+    elif near_zero_fill or (weak_fill and overpriced):
+        prices = [bulk_price, mid_price]
+        shares = [0.92, 0.08]
+    elif weak_fill or overpriced:
+        prices = [bulk_price, mid_price, tail_price]
+        shares = [0.84, 0.13, 0.03]
+    elif sell_volume <= 0.40 * high_volume_soft_cap:
+        prices = [bulk_price, mid_price, tail_price]
+        shares = [0.60, 0.26, 0.14]
+    elif sell_volume <= high_volume_soft_cap:
+        prices = [bulk_price, mid_price, tail_price]
+        shares = [0.74, 0.20, 0.06]
     else:
-        prices = [max(MARKET_PRICE_MIN, gp_price + step, base_ref - step), min(base_ref + 2 * step, market_cap), min(base_ref + 4 * step, market_cap)]
-        shares = [0.70, 0.20, 0.10]
+        prices = [bulk_price, mid_price, tail_price]
+        shares = [0.86, 0.12, 0.02]
+    if underpriced and good_fill and len(shares) == 3 and sell_volume <= 0.45 * high_volume_soft_cap:
+        shares = [0.56, 0.27, 0.17]
+    shares = [s / max(1e-9, sum(shares)) for s in shares]
+
     prices = [round_price(p, price_max=market_cap, price_step=step) for p in prices]
+    for i in range(1, len(prices)):
+        if prices[i] < prices[i - 1]:
+            prices[i] = prices[i - 1]
     out: List[Tuple[float, float]] = []
     allocated = 0.0
     for i, share in enumerate(shares):
@@ -2439,7 +2422,6 @@ def build_ladder(sell_volume: float, market_ref: float, fill_ratio: float, max_t
             out.append((round_vol(vol), prices[i]))
     return out[:max_tickets]
 
-
 def compute_safe_sell_volume(state: Dict[str, Any], object_rows: List[Dict[str, Any]], marketable_useful_now: float, offer_cap: float, reserve: float, balance_now: float, topology: Dict[str, Any], market_ctx: Dict[str, Any]) -> float:
     gen_total = sum(r['generated'] for r in object_rows)
     wind_total = sum(r['generated'] for r in object_rows if r.get('type') == 'wind')
@@ -2447,8 +2429,17 @@ def compute_safe_sell_volume(state: Dict[str, Any], object_rows: List[Dict[str, 
     loss_ratio = safe_float(state.get('loss_ratio_ewma', 0.18), 0.18)
     abs_err = safe_float(state.get('abs_err_ewma', 1.2), 1.2)
     recent_fill = safe_float(market_ctx.get('recent_fill_ratio', safe_float(state.get('fill_ratio_ewma', 0.84), 0.84)), 0.84)
+    recent_execution = safe_float(market_ctx.get('recent_execution_ratio', safe_float(state.get('execution_ratio_ewma', 0.72), 0.72)), 0.72)
     price_realism = safe_float(market_ctx.get('price_realism', 1.0), 1.0)
     has_fill_history = bool(market_ctx.get('has_fill_history', False))
+    has_execution_history = bool(market_ctx.get('has_execution_history', False))
+    overpriced = bool(market_ctx.get('overpriced', False))
+    underpriced = bool(market_ctx.get('underpriced', False))
+    near_zero_fill = bool(market_ctx.get('near_zero_fill', False))
+    market_ref = safe_float(market_ctx.get('market_ref', state.get('market_ref', 4.8)), safe_float(state.get('market_ref', 4.8), 4.8))
+    recent_ask = safe_float(market_ctx.get('recent_ask_price', market_ref), market_ref)
+    market_step = max(0.01, safe_float(market_ctx.get('market_price_step', 0.2), 0.2))
+    ask_gap_steps = (recent_ask - market_ref) / market_step
     uncertainty = 0.22 * abs_err + 0.12 * wind_share * marketable_useful_now
     uncertainty += 0.10 * max(0.0, loss_ratio - 0.12) * marketable_useful_now
     if 'high_network_losses' in topology.get('warnings', []):
@@ -2456,43 +2447,20 @@ def compute_safe_sell_volume(state: Dict[str, Any], object_rows: List[Dict[str, 
     safe_target = max(0.0, min(offer_cap, marketable_useful_now) - max(reserve, uncertainty))
     if has_fill_history and recent_fill < safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.78), 0.78):
         safe_target *= clamp(0.45 + 0.70 * recent_fill, 0.30, 0.95)
+    if has_execution_history and recent_execution < safe_float(MARKET_INSIGHTS.get('good_execution_ratio', 0.72), 0.72):
+        safe_target *= clamp(0.30 + 0.95 * recent_execution, 0.22, 0.92)
     if price_realism < 0.70:
         safe_target *= clamp(price_realism, 0.25, 1.0)
+    if overpriced:
+        safe_target *= clamp(0.66 - 0.07 * max(0.0, ask_gap_steps), 0.34, 0.84)
+    if near_zero_fill:
+        safe_target *= 0.55
+    if underpriced and recent_fill >= safe_float(MARKET_INSIGHTS.get('good_fill_ratio', 0.88), 0.88) and price_realism >= 0.80 and not overpriced:
+        safe_target *= 1.08
     if balance_now < 0.0:
         safe_target = min(safe_target, max(0.0, balance_now + marketable_useful_now))
     safe_target = round_vol(max(0.0, min(offer_cap, marketable_useful_now, safe_target)))
     return safe_target if safe_target >= MIN_ORDER_VOLUME else 0.0
-
-
-def current_theoretical_metrics(state: Dict[str, Any], object_rows: List[Dict[str, Any]], weather: Dict[str, float], bundle: Dict[str, Dict[str, Any]], tick: int, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    sun_now = weather['sun']
-    wind_now = weather['wind']
-    cfg = cfg or state.get('cfg_runtime', {})
-    sun_spread = max(get_forecast_spread(bundle, 'sun', 0.0), safe_float(cfg.get('corridorSun', 0.5), 0.5))
-    wind_spread = max(get_forecast_spread(bundle, 'wind', 0.0), safe_float(cfg.get('corridorWind', 0.5), 0.5))
-    totals = {
-        'solar_theoretical_now': 0.0,
-        'wind_theoretical_now': 0.0,
-        'gross_theoretical_now': 0.0,
-        'load_forecast_now': aggregate_forecast_load(bundle, object_rows, tick),
-        'load_model_now': 0.0,
-        'loss_theoretical_now': 0.0,
-    }
-    for row in object_rows:
-        typ = row['type']
-        gen_theoretical = predict_object_generation(state, row, sun_now, wind_now, sun_spread, wind_spread, cfg=cfg, weather=weather, step_ahead=0)
-        if typ == 'solar':
-            totals['solar_theoretical_now'] += gen_theoretical
-        elif typ == 'wind':
-            totals['wind_theoretical_now'] += gen_theoretical
-        totals['gross_theoretical_now'] += gen_theoretical
-        fc_name = OBJECT_TYPE_TO_FORECAST.get(typ)
-        load_forecast = get_forecast_value(bundle, fc_name, tick) if fc_name else 0.0
-        load_model = predict_object_load(state, row, load_forecast, tick) if fc_name else 0.0
-        totals['load_model_now'] += load_model
-    totals['loss_theoretical_now'] = predict_total_losses(state, totals['gross_theoretical_now'], totals['load_model_now'])
-    return totals
-
 
 def normalize_cfg(raw: Dict[str, Any]) -> Dict[str, Any]:
     def g(name: str, default: float) -> float:
@@ -2522,45 +2490,10 @@ def normalize_cfg(raw: Dict[str, Any]) -> Dict[str, Any]:
         'weatherMaxWind': g('weatherMaxWind', 15.0),
     }
 
-
-def log_tick_data(summary_row: Dict[str, Any], strategy_row: Dict[str, Any]) -> None:
-    ensure_dir(LOG_DIR)
-    write_jsonl(TICK_SUMMARY_FILE, summary_row)
-    write_jsonl(STRATEGY_DEBUG_FILE, strategy_row)
-
-
-def profile_log_fields(profile_ctx: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        'profile_current': profile_ctx.get('current', {}),
-        'profile_next_mixed_in': profile_ctx.get('next_mixed_in'),
-        'profile_next_risk_in': profile_ctx.get('next_risk_in'),
-    }
-
-
-def market_log_fields(market_stats: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        'buy_asked': round(safe_float(market_stats.get('buy_asked', 0.0), 0.0), 6),
-        'buy_contracted': round(safe_float(market_stats.get('buy_contracted', 0.0), 0.0), 6),
-        'buy_instant': round(safe_float(market_stats.get('buy_instant', 0.0), 0.0), 6),
-        'buy_avg_asked_price': market_stats.get('buy_avg_asked_price'),
-        'buy_avg_contracted_price': market_stats.get('buy_avg_contracted_price'),
-        'sell_asked': round(safe_float(market_stats.get('sell_asked', 0.0), 0.0), 6),
-        'sell_contracted': round(safe_float(market_stats.get('sell_contracted', 0.0), 0.0), 6),
-        'sell_instant': round(safe_float(market_stats.get('sell_instant', 0.0), 0.0), 6),
-        'sell_avg_asked_price': market_stats.get('sell_avg_asked_price'),
-        'sell_avg_contracted_price': market_stats.get('sell_avg_contracted_price'),
-    }
-
-
-# =====================
-# Main controller
-# =====================
-
 def controller(psm: Any) -> Dict[str, Any]:
     state = load_state()
     tick = get_tick(psm)
     if tick == 0:
-        reset_runtime_outputs()
         state = default_state()
     game_length = get_game_length(psm)
     cfg = normalize_cfg(get_config_dict(psm))
@@ -2568,8 +2501,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     network_rows = extract_network_rows(psm)
     exchange_rows = [exchange_receipt_data(x) for x in get_exchange_list(psm)]
 
-    total_generated, total_consumed, total_external, total_losses = get_total_power_tuple(psm)
-    net_agg = aggregate_networks(network_rows)
+    total_generated, total_consumed, _, total_losses = get_total_power_tuple(psm)
     obj_agg = aggregate_objects(object_rows)
     topology = analyze_topology(object_rows, network_rows, total_generated)
     weather = {'wind': get_weather_now(psm, 'wind'), 'sun': get_weather_now(psm, 'sun')}
@@ -2588,35 +2520,82 @@ def controller(psm: Any) -> Dict[str, Any]:
     forecast_profile = build_forecast_profile(state, forecast_bundle, object_rows, game_length)
     profile_ctx = forecast_profile_context(forecast_profile, tick, horizon=max(12, LOOKAHEAD * 2))
     future = forecast_window(state, object_rows, forecast_bundle, tick, game_length, LOOKAHEAD)
-    current_theoretical = current_theoretical_metrics(state, object_rows, weather, forecast_bundle, tick, cfg)
 
     useful_raw = compute_useful_energy(total_generated, total_losses)
     useful_now = max(0.0, useful_raw)
     balance_now = compute_balance_energy(total_generated, total_consumed, total_losses)
 
     market_stats = analyze_exchange(exchange_rows)
+    prev_sell_order = safe_float(state.get('last_sell_volume', 0.0), 0.0)
+    executed_sell_now = safe_float(market_stats.get('sell_asked', 0.0), 0.0)
+    execution_ratio_now: Optional[float] = None
+    if prev_sell_order >= MIN_ORDER_VOLUME:
+        execution_ratio_now = clamp(executed_sell_now / max(prev_sell_order, 1e-9), 0.0, 1.0)
+        state['execution_ratio_ewma'] = (
+            0.70 * safe_float(state.get('execution_ratio_ewma', 0.72), 0.72)
+            + 0.30 * execution_ratio_now
+        )
     sell_avg_price = market_stats.get('sell_avg_contracted_price')
     buy_ref = market_stats.get('buy_avg_contracted_price') or market_stats.get('buy_avg_asked_price')
     fill_ratio_now = market_stats.get('sell_fill_ratio')
     exch_log = get_exchange_log(psm)
+    market_step = max(0.01, safe_float(cfg.get('exchangeConsumerPriceStep', 0.2), 0.2))
+    market_floor = clamp(safe_float(cfg.get('exchangeExternalSell', MARKET_PRICE_MIN), MARKET_PRICE_MIN), MARKET_PRICE_MIN, MARKET_PRICE_MAX)
+    market_cap_cfg = clamp(safe_float(cfg.get('exchangeExternalBuy', MARKET_PRICE_MAX), MARKET_PRICE_MAX), market_floor + market_step, MARKET_PRICE_MAX)
+    market_log_window = max(4, safe_int(MARKET_INSIGHTS.get('market_log_window', 12), 12))
+    exchange_prices = extract_exchange_log_prices(exch_log, limit=max(8, market_log_window * 2))
+    state['exchange_price_history'] = exchange_prices
+    market_seed = summarize_market_prices(
+        exchange_prices[-market_log_window:],
+        safe_float(state.get('market_ref', 4.8), 4.8),
+        market_floor + market_step,
+        market_cap_cfg,
+        alpha=safe_float(MARKET_INSIGHTS.get('market_log_ewma_alpha', 0.34), 0.34),
+    )
+    state['exchange_market_ref'] = safe_float(market_seed.get('reference', state.get('market_ref', 4.8)), safe_float(state.get('market_ref', 4.8), 4.8))
     if sell_avg_price is not None:
-        state['market_ref'] = 0.76 * safe_float(state.get('market_ref', 4.8), 4.8) + 0.24 * sell_avg_price
+        prev_ref = safe_float(state.get('market_ref', 4.8), 4.8)
+        execution_weight = safe_float(execution_ratio_now, safe_float(state.get('execution_ratio_ewma', 0.72), 0.72))
+        blend = 0.22 if execution_weight >= 0.60 else 0.12
+        state['market_ref'] = (1.0 - blend) * prev_ref + blend * sell_avg_price
     elif buy_ref is not None:
         prev_ref = safe_float(state.get('market_ref', 4.8), 4.8)
         capped_buy_ref = min(safe_float(buy_ref, prev_ref), prev_ref + 1.2)
         state['market_ref'] = 0.88 * prev_ref + 0.12 * capped_buy_ref
-    elif tick > 0 and tick - 1 < len(exch_log):
-        last_log_price = safe_float(exch_log[tick - 1], state.get('market_ref', 4.8))
-        state['market_ref'] = 0.88 * safe_float(state.get('market_ref', 4.8), 4.8) + 0.12 * last_log_price
+    elif safe_int(market_seed.get('count', 0), 0) > 0:
+        prev_ref = safe_float(state.get('market_ref', 4.8), 4.8)
+        state['market_ref'] = 0.78 * prev_ref + 0.22 * safe_float(market_seed.get('last', prev_ref), prev_ref)
+    if execution_ratio_now is not None and execution_ratio_now < safe_float(MARKET_INSIGHTS.get('poor_execution_ratio', 0.35), 0.35):
+        execution_cap = safe_float(market_seed.get('conservative', state.get('market_ref', 4.8)), safe_float(state.get('market_ref', 4.8), 4.8))
+        state['market_ref'] = 0.82 * safe_float(state.get('market_ref', 4.8), 4.8) + 0.18 * min(
+            safe_float(state.get('market_ref', 4.8), 4.8),
+            execution_cap,
+        )
+    if safe_int(market_seed.get('count', 0), 0) > 0:
+        prev_ref = safe_float(state.get('market_ref', 4.8), 4.8)
+        market_anchor = safe_float(market_seed.get('reference', prev_ref), prev_ref)
+        if sell_avg_price is not None and fill_ratio_now is not None and fill_ratio_now >= safe_float(MARKET_INSIGHTS.get('weak_fill_ratio', 0.72), 0.72):
+            market_anchor = max(
+                market_anchor,
+                min(
+                    safe_float(sell_avg_price, market_anchor),
+                    safe_float(market_seed.get('aggressive', market_anchor), market_anchor) + 1.2 * market_step,
+                ),
+            )
+        blend_to_market = 0.18 if sell_avg_price is not None else 0.28
+        state['market_ref'] = (1.0 - blend_to_market) * prev_ref + blend_to_market * market_anchor
     if fill_ratio_now is not None:
         state['fill_ratio_ewma'] = 0.76 * safe_float(state.get('fill_ratio_ewma', 0.84), 0.84) + 0.24 * fill_ratio_now
-    update_market_history(state, tick, market_stats)
+    update_market_history(state, tick, market_stats, execution_ratio=execution_ratio_now)
     market_ctx = build_market_context(state)
+    state['market_ref'] = safe_float(
+        market_ctx.get('market_ref', state.get('market_ref', 4.8)),
+        safe_float(state.get('market_ref', 4.8), 4.8),
+    )
     anti_dump_cap_preview = compute_offer_cap(state, cfg, tick, useful_now)
     market_ctx['anti_dump_cap'] = anti_dump_cap_preview
-    market_ctx['anti_dump_headroom'] = max(0.0, anti_dump_cap_preview - safe_float(state.get('last_sell_volume', 0.0), 0.0))
+    market_ctx['anti_dump_headroom'] = max(0.0, anti_dump_cap_preview - prev_sell_order)
     decision_loss_ratio = safe_float(state.get('loss_ratio_ewma', 0.18), 0.18)
-    decision_abs_err = safe_float(state.get('abs_err_ewma', 1.2), 1.2)
 
     charge_orders, discharge_orders, battery_dbg = storage_policy(
         state, cfg, obj_agg['storages'], balance_now, future,
@@ -2644,7 +2623,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     offer_cap = compute_offer_cap(state, cfg, tick, marketable_useful_now)
     reserve = compute_reserve(state, future, object_rows, marketable_useful_now, profile_ctx=profile_ctx)
     market_ctx['anti_dump_cap'] = offer_cap
-    market_ctx['anti_dump_headroom'] = max(0.0, offer_cap - safe_float(state.get('last_sell_volume', 0.0), 0.0))
+    market_ctx['anti_dump_headroom'] = max(0.0, offer_cap - prev_sell_order)
     sell_volume = compute_safe_sell_volume(state, object_rows, marketable_useful_now, offer_cap, reserve, balance_now, topology, market_ctx)
     storage_sell_guard_gap = max(MIN_ORDER_VOLUME, 0.006 * len(obj_agg['storages']) * safe_float(cfg['cellCapacity'], 120.0))
     premium_sell_ready = bool(battery_dbg.get('premium_sell_ready', False))
@@ -2663,16 +2642,19 @@ def controller(psm: Any) -> Dict[str, Any]:
         or battery_dbg.get('fill_to_ceiling', False)
     )
     storage_is_nearly_full = physical_storage_room_after_orders <= storage_sell_guard_gap
-    preferred_ask_high = safe_float(MARKET_INSIGHTS.get('preferred_ask_high', 5.0), 5.0)
     recent_ask_price = safe_float(
         market_ctx.get('recent_ask_price', state.get('market_ref', 4.8)),
+        safe_float(state.get('market_ref', 4.8), 4.8),
+    )
+    market_hot_ref = safe_float(
+        market_ctx.get('aggressive_market_ref', market_ctx.get('market_ref', state.get('market_ref', 4.8))),
         safe_float(state.get('market_ref', 4.8), 4.8),
     )
     hot_price_sell_ready = bool(
         premium_sell_ready
         or (
             safe_float(market_ctx.get('price_realism', 1.0), 1.0) >= 0.94
-            and recent_ask_price >= preferred_ask_high
+            and recent_ask_price >= market_hot_ref + 0.8 * market_step
         )
     )
     sell_blocked_for_storage = bool(
@@ -2700,7 +2682,7 @@ def controller(psm: Any) -> Dict[str, Any]:
     storage_excess = battery_dbg['total_soc'] > battery_dbg.get('prep_soc', battery_dbg['target_soc']) + 0.08 * len(obj_agg['storages']) * safe_float(cfg['cellCapacity'], 120.0)
     ladder = build_ladder(
         sell_volume,
-        safe_float(state.get('market_ref', 4.8), 4.8),
+        safe_float(market_ctx.get('market_ref', state.get('market_ref', 4.8)), safe_float(state.get('market_ref', 4.8), 4.8)),
         safe_float(market_ctx.get('recent_fill_ratio', state.get('fill_ratio_ewma', 0.84)), 0.84),
         safe_int(cfg['exchangeMaxTickets'], 100),
         cfg,
@@ -2721,125 +2703,15 @@ def controller(psm: Any) -> Dict[str, Any]:
         for volume, price in ladder:
             psm.orders.sell(volume, price)
 
-    forecast_meta = forecast_bundle.get('_meta', {})
-    score_breakdown = parse_score_breakdown(get_raw_score_delta(psm))
-    score_income = safe_float(score_breakdown.get('income', 0.0), 0.0)
-    score_loss_only = safe_float(score_breakdown.get('loss', 0.0), 0.0)
-    total_score = safe_float(score_breakdown.get('total_score', None), None)
-    if total_score is None:
-        total_score = get_total_score(psm)
     summary_row = {
         'tick': tick,
-        'game_length': game_length,
-        'score_delta': round(score_income - score_loss_only, 6),
-        'score_income': round(score_income, 6),
-        'score_loss_only': round(score_loss_only, 6),
-        'total_score': total_score,
-        'wind_now': round(weather['wind'], 6),
-        'sun_now': round(weather['sun'], 6),
-        'forecast_source': forecast_meta.get('source'),
-        'forecast_path': forecast_meta.get('path'),
-        'forecast_rows': forecast_meta.get('rows'),
-        'solar_actual': round(safe_float(obj_agg['by_type'].get('solar', {}).get('generated', 0.0), 0.0), 6),
-        'wind_actual': round(safe_float(obj_agg['by_type'].get('wind', {}).get('generated', 0.0), 0.0), 6),
-        'solar_theoretical_now': round(current_theoretical['solar_theoretical_now'], 6),
-        'wind_theoretical_now': round(current_theoretical['wind_theoretical_now'], 6),
-        'gross_theoretical_now': round(current_theoretical['gross_theoretical_now'], 6),
-        'load_forecast_now': round(current_theoretical['load_forecast_now'], 6),
-        'load_model_now': round(current_theoretical['load_model_now'], 6),
-        'total_generated': round(total_generated, 6),
-        'total_consumed': round(total_consumed, 6),
-        'total_external': round(total_external, 6),
-        'total_losses': round(total_losses, 6),
-        'physical_balance_now': round(balance_now, 6),
-        'useful_supply_now': round(useful_now, 6),
-        'marketable_useful_now': round(marketable_useful_now, 6),
-        'network_losses_total': round(net_agg['losses_total'], 6),
-        'object_income_total': round(obj_agg['income_total'], 6),
-        'object_loss_total': round(obj_agg['loss_total'], 6),
+        'balance_now': round(balance_now, 6),
         'sell_volume': round(sell_volume, 6),
-        'offer_cap': round(offer_cap, 6),
-        'reserve': round(reserve, 6),
-        'charge_total': round(battery_dbg['charge_total'], 6),
-        'discharge_total': round(battery_dbg['discharge_total'], 6),
-        'discharge_for_market': round(safe_float(battery_dbg.get('discharge_for_market', 0.0), 0.0), 6),
-        'target_soc': round(battery_dbg['target_soc'], 6),
-        'prep_soc': round(safe_float(battery_dbg.get('prep_soc', battery_dbg['target_soc']), battery_dbg['target_soc']), 6),
-        'total_soc': round(battery_dbg['total_soc'], 6),
-        'emergency_floor_soc': round(safe_float(battery_dbg.get('emergency_floor_soc', 0.0), 0.0), 6),
-        'working_floor_soc': round(safe_float(battery_dbg.get('working_floor_soc', 0.0), 0.0), 6),
-        'high_risk_target_soc': round(safe_float(battery_dbg.get('high_risk_target_soc', battery_dbg['target_soc']), battery_dbg['target_soc']), 6),
         'market_ref': round(safe_float(state.get('market_ref', 4.8), 4.8), 6),
-        'fill_ratio_ewma': round(safe_float(state.get('fill_ratio_ewma', 0.84), 0.84), 6),
-        'market_price_realism': round(safe_float(market_ctx.get('price_realism', 1.0), 1.0), 6),
         'market_overpriced': bool(market_ctx.get('overpriced', False)),
-        'storage_mode': battery_dbg.get('mode'),
-        'storage_signal': round(safe_float(battery_dbg.get('signal', 0.0), 0.0), 6),
-        'startup_load_scale': round(startup_scale(state, tick), 6),
-        'ladder': ladder,
-        'topology_warnings': topology.get('warnings', []),
-        'topology_branch_concentration': round(safe_float(topology.get('branch_concentration_score', 0.0), 0.0), 6),
-        'topology_loss_share_est': round(safe_float(topology.get('loss_share_est', 0.0), 0.0), 6),
-        'topology_vulnerabilities': topology.get('vulnerabilities', []),
-        'type_totals': {
-            typ: {
-                'count': data['count'],
-                'generated': round(data['generated'], 6),
-                'consumed': round(data['consumed'], 6),
-                'income': round(data['income'], 6),
-                'loss': round(data['loss'], 6),
-            } for typ, data in obj_agg['by_type'].items()
-        },
-    }
-    summary_row.update(profile_log_fields(profile_ctx))
-    summary_row.update(market_log_fields(market_stats))
-    strategy_row = {
-        'tick': tick,
-        'weather': weather,
-        'forecast_meta': forecast_meta,
-        'score_breakdown_debug': {
-            'format': score_breakdown.get('format'),
-            'ambiguous': bool(score_breakdown.get('ambiguous', False)),
-        },
-        'current_theoretical': current_theoretical,
-        'market_book': market_stats,
-        'config_core': {
-            'exchangeExternalSell': cfg['exchangeExternalSell'],
-            'exchangeExternalBuy': cfg['exchangeExternalBuy'],
-            'exchangeExternalInstantSell': cfg['exchangeExternalInstantSell'],
-            'exchangeExternalInstantBuy': cfg['exchangeExternalInstantBuy'],
-            'exchangeAmountScaler': cfg['exchangeAmountScaler'],
-            'exchangeAmountBuffer': cfg['exchangeAmountBuffer'],
-            'cellCapacity': cfg['cellCapacity'],
-            'cellChargeRate': cfg['cellChargeRate'],
-            'cellDischargeRate': cfg['cellDischargeRate'],
-            'weatherEffectsDelay': cfg['weatherEffectsDelay'],
-        },
-        'models': state.get('object_models', {}),
-        'forecast_profile_context': profile_ctx,
-        'future_window': future,
-        'topology': topology,
-        'market_context': market_ctx,
-        'physical_balance_now': balance_now,
-        'useful_supply_now': useful_now,
-        'gross_marketable_useful_now': gross_marketable_useful_now,
-        'marketable_useful_now': marketable_useful_now,
-        'stress_sell_mode': stress_sell_mode,
-        'startup_mode': startup_mode,
-        'startup_load_scale': startup_scale(state, tick),
-        'reserve_formula': {
-            'abs_err_ewma': decision_abs_err,
-            'loss_ratio_ewma': decision_loss_ratio,
-            'reserve': reserve,
-        },
-        'offer_cap': offer_cap,
-        'battery': battery_dbg,
-        'charge_orders': charge_orders,
-        'discharge_orders': discharge_orders,
-        'sell_volume': sell_volume,
+        'market_underpriced': bool(market_ctx.get('underpriced', False)),
         'ladder': ladder,
     }
-    log_tick_data(summary_row, strategy_row)
     apply_post_tick_learning(
         state,
         object_rows,
@@ -2857,20 +2729,16 @@ def controller(psm: Any) -> Dict[str, Any]:
     save_state(state)
     return summary_row
 
-
 def main() -> None:
-    ensure_dir(LOG_DIR)
     psm = ips.init()
     try:
         summary = controller(psm)
         print(json.dumps(summary, ensure_ascii=False))
     except Exception as e:
-        err = {'tick': get_tick(psm), 'error': str(e), 'traceback': traceback.format_exc()}
-        write_jsonl(STRATEGY_DEBUG_FILE, err)
+        err = {'tick': get_tick(psm), 'error': str(e)}
         print(json.dumps(err, ensure_ascii=False))
     if hasattr(psm, 'save_and_exit'):
         psm.save_and_exit()
-
 
 if __name__ == '__main__':
     main()
