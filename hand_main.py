@@ -6,10 +6,7 @@ import ips
 
 
 # --- Настройки (можно менять вручную) ---
-SURPLUS_MODE_SELL_PRICE = 9.0
-
-# В профиците сначала пытаемся накопить энергию до этого уровня на каждый накопитель
-SURPLUS_TARGET_PER_STORAGE = 80.0
+MANUAL_SELL_PRICE = 8.0
 
 # Параметры накопителей
 STORAGE_CAPACITY = 120.0
@@ -22,6 +19,8 @@ PRICE_ROUND_DIGITS = 2
 EPS = 1e-9
 FLOOR_EPS = 1e-12
 STATE_FILE = "hand_state.json"
+RUNTIME_FALLBACK_STATE_FILES = ("clean_state.json",)
+DISCHARGE_COOLDOWN_TICKS = 1
 
 
 def to_float(value, default=0.0):
@@ -35,6 +34,52 @@ def to_float(value, default=0.0):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def current_power_snapshot(psm):
+    total_power = getattr(psm, "total_power", None)
+    generated = max(0.0, to_float(getattr(total_power, "generated", 0.0), 0.0))
+    consumed = max(0.0, to_float(getattr(total_power, "consumed", 0.0), 0.0))
+    losses = max(0.0, to_float(getattr(total_power, "losses", 0.0), 0.0))
+    external = to_float(getattr(total_power, "external", 0.0), 0.0)
+    balance_from_external = -external
+    # Канонический баланс через API стенда: генерация минус потребление и потери.
+    balance_after_consumption = generated - consumed - losses
+    surplus_now = max(0.0, balance_after_consumption)
+    deficit_now = max(0.0, -balance_after_consumption)
+    return {
+        "generated": generated,
+        "consumed": consumed,
+        "losses": losses,
+        "external": external,
+        "balance_from_external": balance_from_external,
+        "balance_after_consumption": balance_after_consumption,
+        "surplus_now": surplus_now,
+        "deficit_now": deficit_now,
+    }
+
+
+def resolve_runtime_state(state):
+    best_tick = int(to_float(state.get("prev_tick"), -1))
+    best_useful = max(0.0, to_float(state.get("prev_useful_supplied"), 0.0))
+    best_action = str(state.get("prev_storage_action", "idle")).lower()
+
+    for file_name in RUNTIME_FALLBACK_STATE_FILES:
+        if file_name == STATE_FILE:
+            continue
+        try:
+            raw = json.loads(Path(file_name).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        tick = int(to_float(raw.get("prev_tick"), -1))
+        if tick > best_tick:
+            best_tick = tick
+            best_useful = max(0.0, to_float(raw.get("prev_useful_supplied"), 0.0))
+            best_action = str(raw.get("prev_storage_action", "idle")).lower()
+
+    return best_tick, best_useful, best_action
 
 
 def normalize_storage_id(raw_id):
@@ -96,10 +141,6 @@ def apply_discharge(storages, amount_limit):
     return discharged
 
 
-def total_soc(storages):
-    return sum(max(0.0, s["charge"] + s["planned_charge"] - s["planned_discharge"]) for s in storages)
-
-
 psm = ips.init()
 state_path = Path(STATE_FILE)
 state = {}
@@ -110,16 +151,10 @@ try:
 except Exception:
     state = {}
 
-current_generation = 0.0
-current_consumption = 0.0
 storage_objects = []
 
 for obj in psm.objects:
     obj_type = str(getattr(obj, "type", "")).strip().lower()
-    power_now = getattr(getattr(obj, "power", None), "now", None)
-    current_generation += max(0.0, to_float(getattr(power_now, "generated", 0.0), 0.0))
-    current_consumption += max(0.0, to_float(getattr(power_now, "consumed", 0.0), 0.0))
-
     if obj_type == "storage":
         if to_float(getattr(obj, "failed", 0), 0.0) > 0:
             continue
@@ -134,10 +169,15 @@ for obj in psm.objects:
         )
 
 storage_count = len(storage_objects)
-total_power = getattr(psm, "total_power", None)
-current_external = to_float(getattr(total_power, "external", 0.0), 0.0)
-current_losses = max(0.0, to_float(getattr(total_power, "losses", 0.0), 0.0))
-useful_balance = -current_external  # >0: есть полезная энергия к выдаче; <0: дефицит
+power_snapshot = current_power_snapshot(psm)
+current_generated = power_snapshot["generated"]
+current_consumed = power_snapshot["consumed"]
+current_losses = power_snapshot["losses"]
+current_external = power_snapshot["external"]
+balance_from_external = power_snapshot["balance_from_external"]
+energy_after_consumption_now = power_snapshot["balance_after_consumption"]
+surplus_now = power_snapshot["surplus_now"]
+deficit_now = power_snapshot["deficit_now"]
 
 cfg = getattr(psm, "config", {})
 market_min_price = to_float(getattr(cfg, "get", lambda *_: 2.0)("exchangeExternalSell", 2.0), 2.0)
@@ -147,41 +187,34 @@ if market_min_price > market_max_price:
 
 amount_scaler = max(0.0, to_float(getattr(cfg, "get", lambda *_: 1.2)("exchangeAmountScaler", 1.2), 1.2))
 amount_buffer = max(0.0, to_float(getattr(cfg, "get", lambda *_: 10.0)("exchangeAmountBuffer", 10.0), 10.0))
-prev_tick = int(to_float(state.get("prev_tick"), -1))
-prev_useful_supplied = max(0.0, to_float(state.get("prev_useful_supplied"), 0.0))
+prev_tick, prev_useful_supplied, prev_storage_action = resolve_runtime_state(state)
 if prev_tick == psm.tick - 1:
     anti_dump_limit = prev_useful_supplied * amount_scaler + amount_buffer
 else:
     anti_dump_limit = amount_buffer
 
-charged_total = 0.0
-discharged_total = 0.0
 sell_amount = 0.0
-sell_price = SURPLUS_MODE_SELL_PRICE
-mode = "surplus"
+sell_price = MANUAL_SELL_PRICE
+mode = "neutral"
 
-if useful_balance < 0.0:
-    # Дефицит: сначала пытаемся закрыть дефицит разрядом накопителей.
+if deficit_now > EPS:
+    # Дефицит: закрываем нехватку разрядом накопителей, но без мгновенного отката после заряда.
     mode = "deficit"
-    deficit = -useful_balance
-    discharged_total = apply_discharge(storage_objects, deficit)
-    post_balance = useful_balance + discharged_total
-
-    # В дефиците на рынок не продаем: любой остаток направляем в накопители.
-    if storage_count > 0 and post_balance > EPS:
-        charged_total += apply_charge(storage_objects, post_balance)
+    cooldown_active = (
+        prev_tick >= 0
+        and (psm.tick - prev_tick) <= DISCHARGE_COOLDOWN_TICKS
+        and prev_storage_action == "charge"
+    )
+    if not cooldown_active:
+        apply_discharge(storage_objects, deficit_now)
     sell_amount = 0.0
-else:
-    # Профицит: сначала заряжаем накопители, остаток продаем.
-    available_energy = max(0.0, useful_balance)
-    if storage_count > 0 and available_energy > EPS:
-        target_total = min(storage_count * SURPLUS_TARGET_PER_STORAGE, storage_count * STORAGE_CAPACITY)
-        to_target = max(0.0, target_total - total_soc(storage_objects))
-        charged_total = apply_charge(storage_objects, min(available_energy, to_target))
-        available_energy = max(0.0, available_energy - charged_total)
-
-    sell_amount = available_energy
-    sell_price = SURPLUS_MODE_SELL_PRICE
+elif surplus_now > EPS:
+    # Профицит: сначала продаем, остаток направляем в накопители.
+    mode = "surplus"
+    sell_amount = min(surplus_now, anti_dump_limit)
+    residual = max(0.0, surplus_now - sell_amount)
+    if storage_count > 0 and residual > EPS:
+        apply_charge(storage_objects, residual)
 
 sell_amount = max(0.0, min(sell_amount, anti_dump_limit))
 
@@ -204,10 +237,16 @@ sell_price_order = round(clamp(sell_price, market_min_price, market_max_price), 
 if sell_amount_order > EPS:
     psm.orders.sell(sell_amount_order, sell_price_order)
 
-planned_useful_supplied = max(0.0, useful_balance - ordered_charged + ordered_discharged)
+storage_action = "idle"
+if ordered_discharged > EPS:
+    storage_action = "discharge"
+elif ordered_charged > EPS:
+    storage_action = "charge"
+
 new_state = {
     "prev_tick": int(psm.tick),
-    "prev_useful_supplied": round(planned_useful_supplied, 6),
+    "prev_useful_supplied": round(max(0.0, energy_after_consumption_now), 6),
+    "prev_storage_action": storage_action,
 }
 try:
     state_path.write_text(json.dumps(new_state, ensure_ascii=False), encoding="utf-8")
@@ -217,14 +256,16 @@ except Exception:
 print(
     f"TICK={psm.tick} "
     f"MODE={mode} "
-    f"GEN={current_generation:.3f} "
-    f"CONS={current_consumption:.3f} "
+    f"GEN={current_generated:.3f} "
+    f"CONS={current_consumed:.3f} "
     f"LOSSES={current_losses:.3f} "
     f"EXTERNAL={current_external:.3f} "
-    f"USEFUL_BALANCE={useful_balance:.3f} "
+    f"BAL_FROM_EXT={balance_from_external:.3f} "
+    f"BAL_AFTER_CONS={energy_after_consumption_now:.3f} "
+    f"SURPLUS_NOW={surplus_now:.3f} "
+    f"DEFICIT_NOW={deficit_now:.3f} "
     f"ANTI_DUMP_LIMIT={anti_dump_limit:.3f} "
-    f"STORAGE_COUNT={storage_count} "
-    f"SOC_TOTAL={total_soc(storage_objects):.3f} "
+    f"STORAGE_ACTION={storage_action} "
     f"CHARGED={ordered_charged:.3f} "
     f"DISCHARGED={ordered_discharged:.3f} "
     f"SELL={sell_amount_order:.3f}@{sell_price_order:.2f}"

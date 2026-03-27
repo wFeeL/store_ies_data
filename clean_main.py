@@ -8,6 +8,7 @@ import ips
 
 STATE_FILE = "clean_state.json"
 TICKS_LOG_FILE = "clean_ticks_log.txt"
+RUNTIME_FALLBACK_STATE_FILES = ("hand_state.json",)
 
 # Биржа
 MIN_SELL_PRICE = 5.0
@@ -46,34 +47,11 @@ MAX_CHARGE = 15.0
 MAX_DISCHARGE = 20.0
 BASE_RESERVE_PER_STORAGE = 20.0
 
-# Прогноз и дефицит
-GENERAL_LOOKAHEAD = 8
-NIGHT_POST_TAIL = 3
-FINAL_WINDOW_MIN = 10
-
-# Ночные режимы
-KNOWN_NIGHT_WINDOWS = [(0, 11), (48, 59), (96, 99)]
-NIGHT_TARGET_PER_STORAGE = 80.0
-STRONG_NIGHT_TARGET_PER_STORAGE = 100.0
-LATE_GAME_NIGHT_TARGET_CAP = 60.0
-
-# Погодные пороги
-SUN_RELATIVE_DROP_THRESHOLD = 0.85
-WIND_RELATIVE_DROP_THRESHOLD = 0.85
-SUN_NOW_MIN_FOR_RELATIVE_CHECK = 2.0
-WIND_NOW_MIN_FOR_RELATIVE_CHECK = 3.0
-ABSOLUTE_BAD_SUN_AVG = 1.5
-ABSOLUTE_BAD_WIND_AVG = 3.0
-STRONG_NIGHT_WIND_AVG = 4.0
-STRONG_NIGHT_WIND_MIN = 2.5
-LOAD_SPIKE_FACTOR = 1.10
-
 # Вспомогательные
 EPS = 1e-9
 FLOOR_EPS = 1e-12
 ORDER_ROUND_DIGITS = 3
 PRICE_ROUND_DIGITS = 2
-LATE_GAME_NIGHT_START_TICK = 96
 MAX_BASE_PRICE_DROP_PER_TICK = 0.4
 
 # Быстрая адаптация лестницы на плохом рынке
@@ -94,6 +72,9 @@ FAST_SPREAD_MULT = 0.55
 SOFT_SPREAD_MULT = 0.75
 WEAK_SPREAD_MULT = 0.90
 
+# Простая логика накопителей
+DISCHARGE_COOLDOWN_TICKS = 1
+
 
 def to_float(value, default=0.0):
     try:
@@ -106,6 +87,52 @@ def to_float(value, default=0.0):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def current_power_snapshot(psm):
+    total_power = getattr(psm, "total_power", None)
+    generated = max(0.0, to_float(getattr(total_power, "generated", 0.0), 0.0))
+    consumed = max(0.0, to_float(getattr(total_power, "consumed", 0.0), 0.0))
+    losses = max(0.0, to_float(getattr(total_power, "losses", 0.0), 0.0))
+    external = to_float(getattr(total_power, "external", 0.0), 0.0)
+    balance_from_external = -external
+    # Канонический баланс через API стенда: генерация минус потребление и потери.
+    balance_after_consumption = generated - consumed - losses
+    surplus_now = max(0.0, balance_after_consumption)
+    deficit_now = max(0.0, -balance_after_consumption)
+    return {
+        "generated": generated,
+        "consumed": consumed,
+        "losses": losses,
+        "external": external,
+        "balance_from_external": balance_from_external,
+        "balance_after_consumption": balance_after_consumption,
+        "surplus_now": surplus_now,
+        "deficit_now": deficit_now,
+    }
+
+
+def resolve_runtime_state(state):
+    best_tick = int(to_float(state.get("prev_tick"), -1))
+    best_useful = max(0.0, to_float(state.get("prev_useful_supplied"), 0.0))
+    best_action = str(state.get("prev_storage_action", "idle")).lower()
+
+    for file_name in RUNTIME_FALLBACK_STATE_FILES:
+        if file_name == STATE_FILE:
+            continue
+        try:
+            raw = json.loads(Path(file_name).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        tick = int(to_float(raw.get("prev_tick"), -1))
+        if tick > best_tick:
+            best_tick = tick
+            best_useful = max(0.0, to_float(raw.get("prev_useful_supplied"), 0.0))
+            best_action = str(raw.get("prev_storage_action", "idle")).lower()
+
+    return best_tick, best_useful, best_action
 
 
 def weighted_avg(values, weights):
@@ -127,19 +154,6 @@ def median_or_none(values):
     if not clean:
         return None
     return float(statistics.median(clean))
-
-
-def forecast_value(series, idx, fallback=0.0):
-    try:
-        if idx < 0:
-            return float(fallback)
-        if idx >= len(series):
-            if len(series) == 0:
-                return float(fallback)
-            return to_float(series[-1], fallback)
-        return to_float(series[idx], fallback)
-    except Exception:
-        return float(fallback)
 
 
 def normalize_storage_id(raw_id):
@@ -214,15 +228,8 @@ try:
 except Exception:
     state = {}
 
-prev_tick = int(to_float(state.get("prev_tick"), -1))
-prev_useful_supplied = max(0.0, to_float(state.get("prev_useful_supplied"), 0.0))
-prev_total_external = to_float(state.get("prev_total_external"), 0.0)
-prev_generation = max(0.0, to_float(state.get("prev_generation"), 0.0))
-prev_consumption = max(0.0, to_float(state.get("prev_consumption"), 0.0))
-prev_losses = max(0.0, to_float(state.get("prev_losses"), 0.0))
+prev_tick, prev_useful_supplied, prev_storage_action = resolve_runtime_state(state)
 prev_base_sell_price = clamp(to_float(state.get("prev_base_sell_price"), DEFAULT_SELL_PRICE), MIN_SELL_PRICE, MAX_SELL_PRICE)
-prev_solar_factor = max(0.0, to_float(state.get("prev_solar_factor"), 1.0))
-prev_wind_factor = max(0.0, to_float(state.get("prev_wind_factor"), 1.0))
 prev_fill_ewma = state.get("fill_ewma")
 if prev_fill_ewma is not None:
     prev_fill_ewma = clamp(to_float(prev_fill_ewma, 0.0), 0.0, 1.0)
@@ -268,8 +275,6 @@ def is_near_zero_history_entry(entry):
     return fill_bad or instant_bad
 
 
-current_generation = 0.0
-current_consumption = 0.0
 total_storage_charge = 0.0
 storage_objects = []
 
@@ -282,17 +287,8 @@ count_solar = 0
 count_wind = 0
 count_storage = 0
 
-solar_generation_now = 0.0
-wind_generation_now = 0.0
-
 for obj in psm.objects:
     obj_type = str(getattr(obj, "type", "")).strip().lower()
-    power_now = getattr(getattr(obj, "power", None), "now", None)
-    obj_generated = max(0.0, to_float(getattr(power_now, "generated", 0.0), 0.0))
-    obj_consumed = max(0.0, to_float(getattr(power_now, "consumed", 0.0), 0.0))
-
-    current_generation += obj_generated
-    current_consumption += obj_consumed
 
     if obj_type == "housea":
         count_houseA += 1
@@ -306,10 +302,8 @@ for obj in psm.objects:
         count_hospital += 1
     elif obj_type == "solar":
         count_solar += 1
-        solar_generation_now += obj_generated
     elif obj_type == "wind":
         count_wind += 1
-        wind_generation_now += obj_generated
     elif obj_type == "storage":
         if to_float(getattr(obj, "failed", 0), 0.0) > 0:
             continue
@@ -325,18 +319,21 @@ for obj in psm.objects:
         )
         total_storage_charge += charge_now
 
-current_external = to_float(getattr(psm.total_power, "external", 0.0), 0.0)
-current_losses = max(0.0, to_float(getattr(psm.total_power, "losses", 0.0), 0.0))
-current_total_generated = max(0.0, to_float(getattr(psm.total_power, "generated", 0.0), 0.0))
-current_total_consumed = max(0.0, to_float(getattr(psm.total_power, "consumed", 0.0), 0.0))
+power_snapshot = current_power_snapshot(psm)
+current_total_generated = power_snapshot["generated"]
+current_total_consumed = power_snapshot["consumed"]
+current_losses = power_snapshot["losses"]
+current_external = power_snapshot["external"]
+balance_from_external = power_snapshot["balance_from_external"]
+energy_after_consumption_now = power_snapshot["balance_after_consumption"]
+surplus_now = power_snapshot["surplus_now"]
+deficit_now = power_snapshot["deficit_now"]
 
-physical_balance_now = current_generation - current_consumption
-useful_energy_now = max(0.0, -current_external)
+physical_balance_now = current_total_generated - current_total_consumed
+useful_energy_now = surplus_now
+useful_deficit_now = deficit_now
 
 storage_count = count_storage
-total_storage_capacity = storage_count * STORAGE_CAPACITY
-has_solar = count_solar > 0
-has_wind = count_wind > 0
 
 sell_asked = 0.0
 sell_contracted = 0.0
@@ -445,183 +442,7 @@ else:
     prev_useful_supplied = 0.0
     anti_dump_limit = FIRST_TICK_ANTI_DUMP_LIMIT
 anti_dump_limit = max(0.0, anti_dump_limit)
-
-
-def future_load_at(tick_index):
-    return (
-        count_houseA * forecast_value(psm.forecasts.houseA, tick_index, 0.0)
-        + count_houseB * forecast_value(psm.forecasts.houseB, tick_index, 0.0)
-        + count_office * forecast_value(psm.forecasts.office, tick_index, 0.0)
-        + count_factory * forecast_value(psm.forecasts.factory, tick_index, 0.0)
-        + count_hospital * forecast_value(psm.forecasts.hospital, tick_index, 0.0)
-    )
-
-
-night_windows = []
-t = 0
-while t < psm.gameLength:
-    if abs(forecast_value(psm.forecasts.sun, t, 0.0)) <= EPS:
-        start = t
-        while t + 1 < psm.gameLength and abs(forecast_value(psm.forecasts.sun, t + 1, 0.0)) <= EPS:
-            t += 1
-        night_windows.append((start, t))
-    t += 1
-if not night_windows:
-    for start, end in KNOWN_NIGHT_WINDOWS:
-        if start < psm.gameLength:
-            night_windows.append((start, min(end, psm.gameLength - 1)))
-night_windows.sort()
-
-next_night_start = None
-next_night_end = None
-for start, end in night_windows:
-    if end < psm.tick:
-        continue
-    next_night_start = start
-    next_night_end = end
-    break
-
-lookahead = min(GENERAL_LOOKAHEAD, psm.gameLength - psm.tick - 1)
-future_sun_avg = max(0.0, to_float(getattr(psm.sun, "now", 0.0), 0.0))
-future_sun_min = future_sun_avg
-future_wind_avg = max(0.0, to_float(getattr(psm.wind, "now", 0.0), 0.0))
-future_wind_min = future_wind_avg
-max_future_load = current_consumption
-expected_deficit = 0.0
-nearest_deficit_tick = None
-nearest_deficit_value = 0.0
-nearest_deficit_window_need = 0.0
-nearest_deficit_window_open = False
-forecast_balance_prefix = 0.0
-forecast_balance_prefix_min = 0.0
-
-sun_now = max(0.0, to_float(getattr(psm.sun, "now", 0.0), 0.0))
-wind_now = max(0.0, to_float(getattr(psm.wind, "now", 0.0), 0.0))
-
-solar_factor = prev_solar_factor if count_solar > 0 else 0.0
-if count_solar > 0 and sun_now > EPS:
-    solar_factor = solar_generation_now / max(EPS, count_solar * sun_now)
-wind_factor = prev_wind_factor if count_wind > 0 else 0.0
-if count_wind > 0 and wind_now > EPS:
-    wind_factor = wind_generation_now / max(EPS, count_wind * wind_now)
-
-stable_generation_now = max(0.0, current_generation - solar_generation_now - wind_generation_now)
-
-future_sun_values = []
-future_wind_values = []
-
-if lookahead > 0:
-    for ti in range(psm.tick + 1, psm.tick + lookahead + 1):
-        load_t = max(0.0, future_load_at(ti))
-        max_future_load = max(max_future_load, load_t)
-
-        sun_t = max(0.0, forecast_value(psm.forecasts.sun, ti, sun_now))
-        wind_t = max(0.0, forecast_value(psm.forecasts.wind, ti, wind_now))
-        future_sun_values.append(sun_t)
-        future_wind_values.append(wind_t)
-
-        future_solar_generation = count_solar * solar_factor * sun_t
-        future_wind_generation = count_wind * wind_factor * wind_t
-        generation_t = stable_generation_now + future_solar_generation + future_wind_generation
-        balance_t = generation_t - load_t
-        deficit_t = max(0.0, -balance_t)
-        expected_deficit += deficit_t
-
-        if deficit_t > EPS:
-            if nearest_deficit_tick is None:
-                nearest_deficit_tick = ti
-                nearest_deficit_value = deficit_t
-                nearest_deficit_window_need = deficit_t
-                nearest_deficit_window_open = True
-            elif nearest_deficit_window_open:
-                nearest_deficit_window_need += deficit_t
-        elif nearest_deficit_window_open:
-            nearest_deficit_window_open = False
-
-        forecast_balance_prefix += balance_t
-        forecast_balance_prefix_min = min(forecast_balance_prefix_min, forecast_balance_prefix)
-
-    if future_sun_values:
-        future_sun_avg = sum(future_sun_values) / len(future_sun_values)
-        future_sun_min = min(future_sun_values)
-    if future_wind_values:
-        future_wind_avg = sum(future_wind_values) / len(future_wind_values)
-        future_wind_min = min(future_wind_values)
-
-forecast_buffer_need = max(0.0, -forecast_balance_prefix_min)
-nearest_deficit_in_ticks = None if nearest_deficit_tick is None else (nearest_deficit_tick - psm.tick)
-
-future_night_wind_avg = future_wind_avg
-future_night_wind_min = future_wind_min
-future_night_load_avg = current_consumption
-future_night_load_max = current_consumption
-if next_night_start is not None and next_night_end is not None:
-    night_eval_end = min(next_night_end + NIGHT_POST_TAIL, psm.gameLength - 1)
-    night_winds = []
-    night_loads = []
-    for ti in range(next_night_start, night_eval_end + 1):
-        night_winds.append(max(0.0, forecast_value(psm.forecasts.wind, ti, wind_now)))
-        night_loads.append(max(0.0, future_load_at(ti)))
-    if night_winds:
-        future_night_wind_avg = sum(night_winds) / len(night_winds)
-        future_night_wind_min = min(night_winds)
-    if night_loads:
-        future_night_load_avg = sum(night_loads) / len(night_loads)
-        future_night_load_max = max(night_loads)
-
-night_target_charge = storage_count * NIGHT_TARGET_PER_STORAGE
-total_charge_rate = max(MAX_CHARGE, storage_count * MAX_CHARGE)
-ticks_to_fill = math.ceil(max(0.0, night_target_charge - total_storage_charge) / total_charge_rate) if storage_count > 0 else 0
-precharge_horizon = min(GENERAL_LOOKAHEAD, ticks_to_fill + 1)
-
-night_risk = (
-    has_solar
-    and next_night_start is not None
-    and 0 <= (next_night_start - psm.tick) <= precharge_horizon
-)
-
-night_risk_strong = night_risk and (
-    future_night_wind_avg < STRONG_NIGHT_WIND_AVG
-    or future_night_wind_min < STRONG_NIGHT_WIND_MIN
-    or future_night_load_max > current_consumption * LOAD_SPIKE_FACTOR
-)
-
-future_sun_signal = 0.7 * future_sun_avg + 0.3 * future_sun_min
-future_wind_signal = 0.6 * future_wind_avg + 0.4 * future_wind_min
-
-sun_drop = (
-    count_solar > 0
-    and sun_now > SUN_NOW_MIN_FOR_RELATIVE_CHECK
-    and future_sun_signal < SUN_RELATIVE_DROP_THRESHOLD * sun_now
-)
-wind_drop = (
-    count_wind > 0
-    and wind_now > WIND_NOW_MIN_FOR_RELATIVE_CHECK
-    and future_wind_signal < WIND_RELATIVE_DROP_THRESHOLD * wind_now
-)
-absolute_bad_weather = (
-    (count_solar > 0 and future_sun_avg < ABSOLUTE_BAD_SUN_AVG)
-    or (count_wind > 0 and future_wind_avg < ABSOLUTE_BAD_WIND_AVG)
-)
-future_load_risk = (max_future_load > current_generation) or (expected_deficit > EPS)
-weather_deficit_risk = future_load_risk and (sun_drop or wind_drop or absolute_bad_weather)
-obvious_deficit = nearest_deficit_tick is not None
-
-base_target_charge = storage_count * BASE_RESERVE_PER_STORAGE
-strong_night_target_charge = storage_count * STRONG_NIGHT_TARGET_PER_STORAGE
-forecast_deficit_target = min(total_storage_capacity, forecast_buffer_need)
-nearest_deficit_target = min(total_storage_capacity, nearest_deficit_window_need)
-
-target_charge = max(
-    base_target_charge,
-    forecast_deficit_target,
-    nearest_deficit_target,
-    night_target_charge if night_risk else 0.0,
-    strong_night_target_charge if night_risk_strong else 0.0,
-)
-if next_night_start is not None and next_night_start >= LATE_GAME_NIGHT_START_TICK:
-    target_charge = min(target_charge, storage_count * LATE_GAME_NIGHT_TARGET_CAP)
-target_charge = min(target_charge, total_storage_capacity)
+target_charge = storage_count * BASE_RESERVE_PER_STORAGE
 
 recent_exec = [
     h
@@ -674,67 +495,30 @@ if (
     base_sell_price = max(base_sell_price, prev_base_sell_price - MAX_BASE_PRICE_DROP_PER_TICK)
 base_sell_price = round(clamp(base_sell_price, MIN_SELL_PRICE, MAX_SELL_PRICE), PRICE_ROUND_DIGITS)
 
-final_window = max(FINAL_WINDOW_MIN, psm.gameLength // 10)
-in_final_window = psm.tick >= psm.gameLength - final_window
-
 charged_total = 0.0
 discharged_total = 0.0
-extra_market_discharge = 0.0
-effective_useful_energy = useful_energy_now
 sell_amount_total = 0.0
-
-risk_ahead = (
-    night_risk
-    or night_risk_strong
-    or weather_deficit_risk
-    or obvious_deficit
-    or forecast_deficit_target > base_target_charge
-)
-
-if physical_balance_now < 0.0:
-    deficit = -physical_balance_now
-    if in_final_window:
-        discharged_total += apply_discharge(storage_objects, deficit, 0.0, True)
-    else:
-        discharged_primary = apply_discharge(storage_objects, deficit, BASE_RESERVE_PER_STORAGE, False)
+if useful_deficit_now > EPS:
+    # При дефиците только разряжаем накопители, без встречной продажи/заряда.
+    cooldown_active = (
+        prev_tick >= 0
+        and (psm.tick - prev_tick) <= DISCHARGE_COOLDOWN_TICKS
+        and prev_storage_action == "charge"
+    )
+    if not cooldown_active:
+        discharged_primary = apply_discharge(storage_objects, useful_deficit_now, BASE_RESERVE_PER_STORAGE, False)
         discharged_total += discharged_primary
-        remaining = max(0.0, deficit - discharged_primary)
-        if remaining > EPS:
-            discharged_total += apply_discharge(storage_objects, remaining, 0.0, True)
-
-    post_physical_balance = physical_balance_now + discharged_total
-    if in_final_window and storage_count > 0:
-        anti_room = max(0.0, anti_dump_limit)
-        if anti_room > EPS:
-            extra_market_discharge = apply_discharge(storage_objects, anti_room, 0.0, True)
-            discharged_total += extra_market_discharge
-            effective_useful_energy += extra_market_discharge
-            post_physical_balance += extra_market_discharge
-
-    if post_physical_balance > EPS:
-        sell_amount_total = min(effective_useful_energy, anti_dump_limit, post_physical_balance)
+        remaining_deficit = max(0.0, useful_deficit_now - discharged_primary)
+        if remaining_deficit > EPS:
+            discharged_total += apply_discharge(storage_objects, remaining_deficit, 0.0, True)
 else:
-    if storage_count > 0 and risk_ahead and total_storage_charge < target_charge:
-        need_to_target = max(0.0, target_charge - total_storage_charge)
-        charge_from_surplus = min(max(0.0, physical_balance_now), need_to_target)
-        charged_now = apply_charge(storage_objects, charge_from_surplus)
-        charged_total += charged_now
-        effective_useful_energy = max(0.0, useful_energy_now - charged_now)
+    # При профиците всегда сначала продаём, остаток направляем в накопители.
+    available_useful = useful_energy_now
+    sell_amount_total = min(available_useful, anti_dump_limit)
 
-    sell_amount_total = min(effective_useful_energy, anti_dump_limit)
-
-    overflow_energy = max(0.0, effective_useful_energy - sell_amount_total)
-    if overflow_energy > EPS and storage_count > 0:
-        charged_total += apply_charge(storage_objects, overflow_energy)
-
-    if in_final_window and storage_count > 0:
-        anti_room = max(0.0, anti_dump_limit - sell_amount_total)
-        if anti_room > EPS:
-            extra_market_discharge = apply_discharge(storage_objects, anti_room, 0.0, True)
-            if extra_market_discharge > EPS:
-                discharged_total += extra_market_discharge
-                effective_useful_energy += extra_market_discharge
-                sell_amount_total = min(anti_dump_limit, effective_useful_energy)
+    unsold_useful = max(0.0, available_useful - sell_amount_total)
+    if unsold_useful > EPS and storage_count > 0:
+        charged_total += apply_charge(storage_objects, unsold_useful)
 
 sell_amount_total = max(0.0, min(sell_amount_total, anti_dump_limit))
 
@@ -852,16 +636,23 @@ ladder_str = "NONE"
 if final_ladder:
     ladder_str = "|".join(f"{a:.3f}@{p:.2f}" for a, p in final_ladder)
 
-nearest_deficit_tick_str = "NA" if nearest_deficit_tick is None else str(int(nearest_deficit_tick))
-nearest_deficit_in_str = "NA" if nearest_deficit_in_ticks is None else str(int(nearest_deficit_in_ticks))
+storage_action = "idle"
+if ordered_discharged_total > EPS:
+    storage_action = "discharge"
+elif ordered_charged_total > EPS:
+    storage_action = "charge"
 
 tick_log_line = (
     f"TICK={psm.tick} "
-    f"GEN={current_generation:.3f} "
-    f"CONS={current_consumption:.3f} "
+    f"GEN={current_total_generated:.3f} "
+    f"CONS={current_total_consumed:.3f} "
     f"EXTERNAL={current_external:.3f} "
     f"LOSSES={current_losses:.3f} "
+    f"BAL_FROM_EXT={balance_from_external:.3f} "
     f"PHYSICAL_BALANCE={physical_balance_now:.3f} "
+    f"BAL_AFTER_CONS={energy_after_consumption_now:.3f} "
+    f"SURPLUS_NOW={surplus_now:.3f} "
+    f"DEFICIT_NOW={deficit_now:.3f} "
     f"USEFUL_ENERGY_NOW={useful_energy_now:.3f} "
     f"PREV_USEFUL_SUPPLIED={prev_useful_supplied:.3f} "
     f"ANTI_DUMP_LIMIT={anti_dump_limit:.3f} "
@@ -874,15 +665,7 @@ tick_log_line = (
     f"LADDER={ladder_str} "
     f"TOTAL_SOC={total_storage_charge:.3f} "
     f"TARGET_CHARGE={target_charge:.3f} "
-    f"EXPECTED_DEFICIT_SUM={expected_deficit:.3f} "
-    f"FORECAST_BUFFER_NEED={forecast_buffer_need:.3f} "
-    f"NEAREST_DEFICIT_TICK={nearest_deficit_tick_str} "
-    f"NEAREST_DEFICIT_IN={nearest_deficit_in_str} "
-    f"NEAREST_DEFICIT_PWR={nearest_deficit_value:.3f} "
-    f"NEAREST_DEFICIT_WINDOW={nearest_deficit_window_need:.3f} "
-    f"NIGHT_RISK={night_risk} "
-    f"WEATHER_DEFICIT_RISK={weather_deficit_risk} "
-    f"OBVIOUS_DEFICIT={obvious_deficit} "
+    f"STORAGE_ACTION={storage_action} "
     f"CHARGED_TOTAL={ordered_charged_total:.3f} "
     f"DISCHARGED_TOTAL={ordered_discharged_total:.3f}"
 )
@@ -899,13 +682,8 @@ except Exception:
 new_state = {
     "prev_tick": int(psm.tick),
     "prev_useful_supplied": round(useful_energy_now, 6),
-    "prev_total_external": round(current_external, 6),
-    "prev_generation": round(current_total_generated, 6),
-    "prev_consumption": round(current_total_consumed, 6),
-    "prev_losses": round(current_losses, 6),
     "prev_base_sell_price": round(base_sell_price, PRICE_ROUND_DIGITS),
-    "prev_solar_factor": round(max(0.0, solar_factor), 6),
-    "prev_wind_factor": round(max(0.0, wind_factor), 6),
+    "prev_storage_action": storage_action,
     "fill_ewma": None if fill_ewma is None else round(fill_ewma, 6),
     "market_history": [
         {

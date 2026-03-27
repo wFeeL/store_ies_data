@@ -8,6 +8,7 @@ import ips
 
 STATE_FILE = "clean_state.json"
 TICKS_LOG_FILE = "clean_ticks_log.txt"
+RUNTIME_FALLBACK_STATE_FILES = ("hand_state.json",)
 
 # Биржа
 MIN_SELL_PRICE = 5.0
@@ -77,6 +78,7 @@ LATE_GAME_NIGHT_START_TICK = 96
 NEAR_ZERO_LADDER_STEP_MULT = 0.6
 NEAR_ZERO_LADDER_ORDERS = 2
 MAX_BASE_PRICE_DROP_PER_TICK = 0.2
+DISCHARGE_COOLDOWN_TICKS = 1
 
 
 def to_float(value, default=0.0):
@@ -90,6 +92,29 @@ def to_float(value, default=0.0):
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def resolve_runtime_state(state):
+    best_tick = int(to_float(state.get("prev_tick"), -1))
+    best_useful = max(0.0, to_float(state.get("prev_useful_supplied"), 0.0))
+    best_action = str(state.get("prev_storage_action", "idle")).lower()
+
+    for file_name in RUNTIME_FALLBACK_STATE_FILES:
+        if file_name == STATE_FILE:
+            continue
+        try:
+            raw = json.loads(Path(file_name).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        tick = int(to_float(raw.get("prev_tick"), -1))
+        if tick > best_tick:
+            best_tick = tick
+            best_useful = max(0.0, to_float(raw.get("prev_useful_supplied"), 0.0))
+            best_action = str(raw.get("prev_storage_action", "idle")).lower()
+
+    return best_tick, best_useful, best_action
 
 
 def weighted_avg(values, weights):
@@ -134,6 +159,15 @@ def normalize_storage_id(raw_id):
         if "storage" in head:
             return f"c{raw_id[1]}"
     return str(raw_id)
+
+
+def storage_order_id(obj):
+    address = getattr(obj, "address", None)
+    if isinstance(address, (list, tuple)) and address:
+        addr0 = str(address[0])
+        if addr0:
+            return addr0
+    return normalize_storage_id(getattr(obj, "id", ""))
 
 
 def order_amount(value):
@@ -189,8 +223,7 @@ try:
 except Exception:
     state = {}
 
-prev_tick = int(to_float(state.get("prev_tick"), -1))
-prev_useful_supplied = max(0.0, to_float(state.get("prev_useful_supplied"), 0.0))
+prev_tick, prev_useful_supplied, prev_storage_action = resolve_runtime_state(state)
 prev_total_external = to_float(state.get("prev_total_external"), 0.0)
 prev_generation = max(0.0, to_float(state.get("prev_generation"), 0.0))
 prev_consumption = max(0.0, to_float(state.get("prev_consumption"), 0.0))
@@ -249,7 +282,7 @@ solar_generation_now = 0.0
 wind_generation_now = 0.0
 
 for obj in psm.objects:
-    obj_type = str(getattr(obj, "type", "")).lower()
+    obj_type = str(getattr(obj, "type", "")).strip().lower()
     power_now = getattr(getattr(obj, "power", None), "now", None)
     obj_generated = max(0.0, to_float(getattr(power_now, "generated", 0.0), 0.0))
     obj_consumed = max(0.0, to_float(getattr(power_now, "consumed", 0.0), 0.0))
@@ -274,11 +307,13 @@ for obj in psm.objects:
         count_wind += 1
         wind_generation_now += obj_generated
     elif obj_type == "storage":
+        if to_float(getattr(obj, "failed", 0), 0.0) > 0:
+            continue
         count_storage += 1
         charge_now = max(0.0, to_float(getattr(getattr(obj, "charge", None), "now", 0.0), 0.0))
         storage_objects.append(
             {
-                "id": normalize_storage_id(getattr(obj, "id", "")),
+                "id": storage_order_id(obj),
                 "charge": charge_now,
                 "planned_charge": 0.0,
                 "planned_discharge": 0.0,
@@ -604,67 +639,31 @@ if prev_base_sell_price > EPS and not good_fill:
     base_sell_price = max(base_sell_price, prev_base_sell_price - MAX_BASE_PRICE_DROP_PER_TICK)
 base_sell_price = round(clamp(base_sell_price, MIN_SELL_PRICE, MAX_SELL_PRICE), PRICE_ROUND_DIGITS)
 
-final_window = max(FINAL_WINDOW_MIN, psm.gameLength // 10)
-in_final_window = psm.tick >= psm.gameLength - final_window
-
 charged_total = 0.0
 discharged_total = 0.0
-extra_market_discharge = 0.0
-effective_useful_energy = useful_energy_now
 sell_amount_total = 0.0
-
-risk_ahead = (
-    night_risk
-    or night_risk_strong
-    or weather_deficit_risk
-    or obvious_deficit
-    or forecast_deficit_target > base_target_charge
-)
-
-if physical_balance_now < 0.0:
-    deficit = -physical_balance_now
-    if in_final_window:
-        discharged_total += apply_discharge(storage_objects, deficit, 0.0, True)
-    else:
-        discharged_primary = apply_discharge(storage_objects, deficit, BASE_RESERVE_PER_STORAGE, False)
+useful_deficit_now = max(0.0, current_external)
+if useful_deficit_now > EPS:
+    # При дефиците только разряжаем накопители, без встречной продажи/заряда.
+    cooldown_active = (
+        prev_tick >= 0
+        and (psm.tick - prev_tick) <= DISCHARGE_COOLDOWN_TICKS
+        and prev_storage_action == "charge"
+    )
+    if not cooldown_active:
+        discharged_primary = apply_discharge(storage_objects, useful_deficit_now, BASE_RESERVE_PER_STORAGE, False)
         discharged_total += discharged_primary
-        remaining = max(0.0, deficit - discharged_primary)
-        if remaining > EPS:
-            discharged_total += apply_discharge(storage_objects, remaining, 0.0, True)
-
-    post_physical_balance = physical_balance_now + discharged_total
-    if in_final_window and storage_count > 0:
-        anti_room = max(0.0, anti_dump_limit)
-        if anti_room > EPS:
-            extra_market_discharge = apply_discharge(storage_objects, anti_room, 0.0, True)
-            discharged_total += extra_market_discharge
-            effective_useful_energy += extra_market_discharge
-            post_physical_balance += extra_market_discharge
-
-    if post_physical_balance > EPS:
-        sell_amount_total = min(effective_useful_energy, anti_dump_limit, post_physical_balance)
+        remaining_deficit = max(0.0, useful_deficit_now - discharged_primary)
+        if remaining_deficit > EPS:
+            discharged_total += apply_discharge(storage_objects, remaining_deficit, 0.0, True)
 else:
-    if storage_count > 0 and risk_ahead and total_storage_charge < target_charge:
-        need_to_target = max(0.0, target_charge - total_storage_charge)
-        charge_from_surplus = min(max(0.0, physical_balance_now), need_to_target)
-        charged_now = apply_charge(storage_objects, charge_from_surplus)
-        charged_total += charged_now
-        effective_useful_energy = max(0.0, useful_energy_now - charged_now)
+    # При профиците сначала продаём, остаток направляем в накопители.
+    available_useful = useful_energy_now
+    sell_amount_total = min(available_useful, anti_dump_limit)
 
-    sell_amount_total = min(effective_useful_energy, anti_dump_limit)
-
-    overflow_energy = max(0.0, effective_useful_energy - sell_amount_total)
-    if overflow_energy > EPS and storage_count > 0:
-        charged_total += apply_charge(storage_objects, overflow_energy)
-
-    if in_final_window and storage_count > 0:
-        anti_room = max(0.0, anti_dump_limit - sell_amount_total)
-        if anti_room > EPS:
-            extra_market_discharge = apply_discharge(storage_objects, anti_room, 0.0, True)
-            if extra_market_discharge > EPS:
-                discharged_total += extra_market_discharge
-                effective_useful_energy += extra_market_discharge
-                sell_amount_total = min(anti_dump_limit, effective_useful_energy)
+    unsold_useful = max(0.0, available_useful - sell_amount_total)
+    if unsold_useful > EPS and storage_count > 0:
+        charged_total += apply_charge(storage_objects, unsold_useful)
 
 sell_amount_total = max(0.0, min(sell_amount_total, anti_dump_limit))
 
@@ -753,6 +752,11 @@ if final_ladder:
 
 nearest_deficit_tick_str = "NA" if nearest_deficit_tick is None else str(int(nearest_deficit_tick))
 nearest_deficit_in_str = "NA" if nearest_deficit_in_ticks is None else str(int(nearest_deficit_in_ticks))
+storage_action = "idle"
+if ordered_discharged_total > EPS:
+    storage_action = "discharge"
+elif ordered_charged_total > EPS:
+    storage_action = "charge"
 
 tick_log_line = (
     f"TICK={psm.tick} "
@@ -773,6 +777,7 @@ tick_log_line = (
     f"LADDER={ladder_str} "
     f"TOTAL_SOC={total_storage_charge:.3f} "
     f"TARGET_CHARGE={target_charge:.3f} "
+    f"STORAGE_ACTION={storage_action} "
     f"EXPECTED_DEFICIT_SUM={expected_deficit:.3f} "
     f"FORECAST_BUFFER_NEED={forecast_buffer_need:.3f} "
     f"NEAREST_DEFICIT_TICK={nearest_deficit_tick_str} "
@@ -805,6 +810,7 @@ new_state = {
     "prev_base_sell_price": round(base_sell_price, PRICE_ROUND_DIGITS),
     "prev_solar_factor": round(max(0.0, solar_factor), 6),
     "prev_wind_factor": round(max(0.0, wind_factor), 6),
+    "prev_storage_action": storage_action,
     "fill_ewma": None if fill_ewma is None else round(fill_ewma, 6),
     "market_history": [
         {

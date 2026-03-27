@@ -115,13 +115,15 @@ def current_balance(psm: Any) -> Dict[str, float]:
     generated = safe_float(getattr(total_power, "generated", 0.0), 0.0)
     consumed = safe_float(getattr(total_power, "consumed", 0.0), 0.0)
     losses = safe_float(getattr(total_power, "losses", 0.0), 0.0)
-    useful = max(0.0, generated - losses)
+    # Доступный остаток энергии на текущем тике: генерация минус потребление и потери.
+    balance_after_consumption = generated - consumed - losses
+    useful = max(0.0, balance_after_consumption)
     return {
         "generated": generated,
         "consumed": consumed,
         "losses": losses,
         "useful": useful,
-        "balance": generated - consumed - losses,
+        "balance": balance_after_consumption,
     }
 
 
