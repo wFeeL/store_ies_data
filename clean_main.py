@@ -644,6 +644,7 @@ for amount, price in ladder_orders:
 ladder_str = "NONE"
 if final_ladder:
     ladder_str = "|".join(f"{a:.3f}@{p:.2f}" for a, p in final_ladder)
+ordered_sell_total = sum(a for a, _ in final_ladder)
 
 storage_action = "idle"
 if ordered_discharged_total > EPS:
@@ -691,7 +692,7 @@ except Exception:
 
 new_state = {
     "prev_tick": int(psm.tick),
-    "prev_useful_supplied": round(surplus_now, 6),
+    "prev_useful_supplied": round(max(0.0, ordered_sell_total), 6),
     "prev_base_sell_price": round(base_sell_price, PRICE_ROUND_DIGITS),
     "prev_storage_action": storage_action,
     "fill_ewma": None if fill_ewma is None else round(fill_ewma, 6),
