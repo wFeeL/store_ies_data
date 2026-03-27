@@ -74,6 +74,7 @@ WEAK_SPREAD_MULT = 0.90
 
 # Простая логика накопителей
 DISCHARGE_COOLDOWN_TICKS = 1
+ENDGAME_SELL_ONLY_TICKS = 8
 
 
 def to_float(value, default=0.0):
@@ -337,6 +338,8 @@ useful_energy_now = surplus_now
 useful_deficit_now = deficit_now
 
 storage_count = count_storage
+game_length = int(to_float(getattr(psm, "gameLength", 0), 0))
+endgame_sell_only = game_length > 0 and psm.tick >= max(0, game_length - ENDGAME_SELL_ONLY_TICKS)
 
 sell_asked = 0.0
 sell_contracted = 0.0
@@ -515,19 +518,23 @@ if useful_deficit_now > EPS:
         if remaining_deficit > EPS:
             discharged_total += apply_discharge(storage_objects, remaining_deficit, 0.0, True)
 else:
-    # При профиците сначала пытаемся накопить всю возможную энергию.
     available_useful = useful_energy_now
-    if storage_count > 0 and available_useful > EPS:
-        charged_now = apply_charge(storage_objects, available_useful)
-        charged_total += charged_now
-        available_useful = max(0.0, available_useful - charged_now)
+    if endgame_sell_only:
+        # В конце игры не копим новый профицит, а продаем его сразу.
+        sell_amount_total = min(available_useful, anti_dump_limit)
+    else:
+        # При профиците сначала пытаемся накопить всю возможную энергию.
+        if storage_count > 0 and available_useful > EPS:
+            charged_now = apply_charge(storage_objects, available_useful)
+            charged_total += charged_now
+            available_useful = max(0.0, available_useful - charged_now)
 
-    # Продаем только то, что не удалось запасти.
-    sell_amount_total = min(available_useful, anti_dump_limit)
+        # Продаем только то, что не удалось запасти.
+        sell_amount_total = min(available_useful, anti_dump_limit)
 
-    unsold_useful = max(0.0, available_useful - sell_amount_total)
-    if unsold_useful > EPS and storage_count > 0:
-        charged_total += apply_charge(storage_objects, unsold_useful)
+        unsold_useful = max(0.0, available_useful - sell_amount_total)
+        if unsold_useful > EPS and storage_count > 0:
+            charged_total += apply_charge(storage_objects, unsold_useful)
 
 sell_amount_total = max(0.0, min(sell_amount_total, anti_dump_limit))
 
