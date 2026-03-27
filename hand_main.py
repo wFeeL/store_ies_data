@@ -42,13 +42,15 @@ def current_power_snapshot(psm):
     consumed = max(0.0, to_float(getattr(total_power, "consumed", 0.0), 0.0))
     losses = max(0.0, to_float(getattr(total_power, "losses", 0.0), 0.0))
     external = to_float(getattr(total_power, "external", 0.0), 0.0)
+    generated_from_balance = consumed + losses - external
     balance_from_external = -external
-    # Канонический баланс через API стенда: генерация минус потребление и потери.
-    balance_after_consumption = generated - consumed - losses
-    surplus_now = max(0.0, balance_after_consumption)
-    deficit_now = max(0.0, -balance_after_consumption)
+    # Для логики тика используем прямой сигнал API: отрицательный external = профицит, положительный = дефицит.
+    balance_after_consumption = balance_from_external
+    surplus_now = max(0.0, balance_from_external)
+    deficit_now = max(0.0, external)
     return {
         "generated": generated,
+        "generated_from_balance": generated_from_balance,
         "consumed": consumed,
         "losses": losses,
         "external": external,
@@ -171,6 +173,7 @@ for obj in psm.objects:
 storage_count = len(storage_objects)
 power_snapshot = current_power_snapshot(psm)
 current_generated = power_snapshot["generated"]
+current_generated_from_balance = power_snapshot["generated_from_balance"]
 current_consumed = power_snapshot["consumed"]
 current_losses = power_snapshot["losses"]
 current_external = power_snapshot["external"]
@@ -245,7 +248,7 @@ elif ordered_charged > EPS:
 
 new_state = {
     "prev_tick": int(psm.tick),
-    "prev_useful_supplied": round(max(0.0, energy_after_consumption_now), 6),
+    "prev_useful_supplied": round(surplus_now, 6),
     "prev_storage_action": storage_action,
 }
 try:
@@ -257,6 +260,7 @@ print(
     f"TICK={psm.tick} "
     f"MODE={mode} "
     f"GEN={current_generated:.3f} "
+    f"GEN_FROM_BAL={current_generated_from_balance:.3f} "
     f"CONS={current_consumed:.3f} "
     f"LOSSES={current_losses:.3f} "
     f"EXTERNAL={current_external:.3f} "

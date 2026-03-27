@@ -95,13 +95,15 @@ def current_power_snapshot(psm):
     consumed = max(0.0, to_float(getattr(total_power, "consumed", 0.0), 0.0))
     losses = max(0.0, to_float(getattr(total_power, "losses", 0.0), 0.0))
     external = to_float(getattr(total_power, "external", 0.0), 0.0)
+    generated_from_balance = consumed + losses - external
     balance_from_external = -external
-    # Канонический баланс через API стенда: генерация минус потребление и потери.
-    balance_after_consumption = generated - consumed - losses
-    surplus_now = max(0.0, balance_after_consumption)
-    deficit_now = max(0.0, -balance_after_consumption)
+    # Для логики тика используем прямой сигнал API: отрицательный external = профицит, положительный = дефицит.
+    balance_after_consumption = balance_from_external
+    surplus_now = max(0.0, balance_from_external)
+    deficit_now = max(0.0, external)
     return {
         "generated": generated,
+        "generated_from_balance": generated_from_balance,
         "consumed": consumed,
         "losses": losses,
         "external": external,
@@ -321,6 +323,7 @@ for obj in psm.objects:
 
 power_snapshot = current_power_snapshot(psm)
 current_total_generated = power_snapshot["generated"]
+current_generated_from_balance = power_snapshot["generated_from_balance"]
 current_total_consumed = power_snapshot["consumed"]
 current_losses = power_snapshot["losses"]
 current_external = power_snapshot["external"]
@@ -645,6 +648,7 @@ elif ordered_charged_total > EPS:
 tick_log_line = (
     f"TICK={psm.tick} "
     f"GEN={current_total_generated:.3f} "
+    f"GEN_FROM_BAL={current_generated_from_balance:.3f} "
     f"CONS={current_total_consumed:.3f} "
     f"EXTERNAL={current_external:.3f} "
     f"LOSSES={current_losses:.3f} "
@@ -681,7 +685,7 @@ except Exception:
 
 new_state = {
     "prev_tick": int(psm.tick),
-    "prev_useful_supplied": round(useful_energy_now, 6),
+    "prev_useful_supplied": round(surplus_now, 6),
     "prev_base_sell_price": round(base_sell_price, PRICE_ROUND_DIGITS),
     "prev_storage_action": storage_action,
     "fill_ewma": None if fill_ewma is None else round(fill_ewma, 6),
