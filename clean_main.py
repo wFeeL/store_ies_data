@@ -74,7 +74,8 @@ WEAK_SPREAD_MULT = 0.90
 
 # Простая логика накопителей
 DISCHARGE_COOLDOWN_TICKS = 1
-ENDGAME_SELL_ONLY_TICKS = 8
+ENDGAME_MARKET_DISCHARGE_TICKS = 4
+ENDGAME_MIN_FILL_EWMA = 0.70
 
 
 def to_float(value, default=0.0):
@@ -236,6 +237,7 @@ prev_base_sell_price = clamp(to_float(state.get("prev_base_sell_price"), DEFAULT
 prev_fill_ewma = state.get("fill_ewma")
 if prev_fill_ewma is not None:
     prev_fill_ewma = clamp(to_float(prev_fill_ewma, 0.0), 0.0, 1.0)
+initial_total_soc = state.get("initial_total_soc")
 
 market_history = []
 raw_history = state.get("market_history")
@@ -338,8 +340,11 @@ useful_energy_now = surplus_now
 useful_deficit_now = deficit_now
 
 storage_count = count_storage
-game_length = int(to_float(getattr(psm, "gameLength", 0), 0))
-endgame_sell_only = game_length > 0 and psm.tick >= max(0, game_length - ENDGAME_SELL_ONLY_TICKS)
+game_length = int(to_float(getattr(psm, "gameLength", 0), 0.0))
+ticks_left = max(0, game_length - psm.tick) if game_length > 0 else 0
+endgame_market_discharge = game_length > 0 and psm.tick >= max(0, game_length - ENDGAME_MARKET_DISCHARGE_TICKS)
+if psm.tick == 0:
+    initial_total_soc = total_storage_charge
 
 sell_asked = 0.0
 sell_contracted = 0.0
@@ -504,6 +509,7 @@ base_sell_price = round(clamp(base_sell_price, MIN_SELL_PRICE, MAX_SELL_PRICE), 
 charged_total = 0.0
 discharged_total = 0.0
 sell_amount_total = 0.0
+endgame_extra_discharge = 0.0
 if useful_deficit_now > EPS:
     # При дефиците только разряжаем накопители, без встречной продажи/заряда.
     cooldown_active = (
@@ -518,12 +524,29 @@ if useful_deficit_now > EPS:
         if remaining_deficit > EPS:
             discharged_total += apply_discharge(storage_objects, remaining_deficit, 0.0, True)
 else:
-    available_useful = useful_energy_now
-    if endgame_sell_only:
-        # В конце игры не копим новый профицит, а продаем его сразу.
-        sell_amount_total = min(available_useful, anti_dump_limit)
+    endgame_sell_ready = (
+        endgame_market_discharge
+        and storage_count > 0
+        and (useful_energy_now > EPS or ticks_left <= 1)
+        and (fill_ewma is None or fill_ewma >= ENDGAME_MIN_FILL_EWMA)
+    )
+    if endgame_sell_ready:
+        # В самом конце игры текущий профицит продаем сразу, а накопитель используем,
+        # чтобы добить продажу до антидемпингового лимита. Лишний текущий профицит
+        # все еще можно докинуть в накопитель, если лимита продажи не хватает.
+        sell_amount_total = min(useful_energy_now, anti_dump_limit)
+        extra_sell_headroom = max(0.0, anti_dump_limit - sell_amount_total)
+        if extra_sell_headroom > EPS:
+            endgame_extra_discharge = apply_discharge(storage_objects, extra_sell_headroom, 0.0, True)
+            discharged_total += endgame_extra_discharge
+            sell_amount_total += endgame_extra_discharge
+
+        unsold_useful = max(0.0, useful_energy_now - sell_amount_total)
+        if unsold_useful > EPS:
+            charged_total += apply_charge(storage_objects, unsold_useful)
     else:
-        # При профиците сначала пытаемся накопить всю возможную энергию.
+        # В обычном режиме сначала пытаемся накопить текущий профицит.
+        available_useful = useful_energy_now
         if storage_count > 0 and available_useful > EPS:
             charged_now = apply_charge(storage_objects, available_useful)
             charged_total += charged_now
@@ -682,7 +705,10 @@ tick_log_line = (
     f"BASE_SELL_PRICE={base_sell_price:.2f} "
     f"LADDER={ladder_str} "
     f"TOTAL_SOC={total_storage_charge:.3f} "
+    f"INITIAL_TOTAL_SOC={'NA' if initial_total_soc is None else f'{to_float(initial_total_soc, 0.0):.3f}'} "
     f"TARGET_CHARGE={target_charge:.3f} "
+    f"ENDGAME_RELEASE={'1' if endgame_market_discharge else '0'} "
+    f"ENDGAME_EXTRA_DISCHARGED={endgame_extra_discharge:.3f} "
     f"STORAGE_ACTION={storage_action} "
     f"CHARGED_TOTAL={ordered_charged_total:.3f} "
     f"DISCHARGED_TOTAL={ordered_discharged_total:.3f}"
@@ -725,6 +751,8 @@ new_state = {
         for item in market_history[-MARKET_REF_WINDOW:]
     ],
 }
+if initial_total_soc is not None:
+    new_state["initial_total_soc"] = round(max(0.0, to_float(initial_total_soc, 0.0)), 6)
 try:
     state_path.write_text(json.dumps(new_state, ensure_ascii=False), encoding="utf-8")
 except Exception:
