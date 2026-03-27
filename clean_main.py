@@ -152,6 +152,15 @@ def normalize_storage_id(raw_id):
     return str(raw_id)
 
 
+def storage_order_id(obj):
+    address = getattr(obj, "address", None)
+    if isinstance(address, (list, tuple)) and address:
+        addr0 = str(address[0])
+        if addr0:
+            return addr0
+    return normalize_storage_id(getattr(obj, "id", ""))
+
+
 def order_amount(value):
     scale = 10 ** ORDER_ROUND_DIGITS
     clipped = max(0.0, to_float(value, 0.0))
@@ -277,7 +286,7 @@ solar_generation_now = 0.0
 wind_generation_now = 0.0
 
 for obj in psm.objects:
-    obj_type = str(getattr(obj, "type", "")).lower()
+    obj_type = str(getattr(obj, "type", "")).strip().lower()
     power_now = getattr(getattr(obj, "power", None), "now", None)
     obj_generated = max(0.0, to_float(getattr(power_now, "generated", 0.0), 0.0))
     obj_consumed = max(0.0, to_float(getattr(power_now, "consumed", 0.0), 0.0))
@@ -302,11 +311,13 @@ for obj in psm.objects:
         count_wind += 1
         wind_generation_now += obj_generated
     elif obj_type == "storage":
+        if to_float(getattr(obj, "failed", 0), 0.0) > 0:
+            continue
         count_storage += 1
         charge_now = max(0.0, to_float(getattr(getattr(obj, "charge", None), "now", 0.0), 0.0))
         storage_objects.append(
             {
-                "id": normalize_storage_id(getattr(obj, "id", "")),
+                "id": storage_order_id(obj),
                 "charge": charge_now,
                 "planned_charge": 0.0,
                 "planned_discharge": 0.0,
