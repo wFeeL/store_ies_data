@@ -6,7 +6,6 @@ import ips
 
 
 # --- Настройки (можно менять вручную) ---
-DEFICIT_MODE_SELL_PRICE = 7.0
 SURPLUS_MODE_SELL_PRICE = 9.0
 
 # В профиците сначала пытаемся накопить энергию до этого уровня на каждый накопитель
@@ -161,7 +160,6 @@ if useful_balance < 0.0:
     if storage_count > 0 and post_balance > EPS:
         charged_total += apply_charge(storage_objects, post_balance)
     sell_amount = 0.0
-    sell_price = DEFICIT_MODE_SELL_PRICE
 else:
     # Профицит: сначала заряжаем накопители, остаток продаем.
     available_energy = max(0.0, useful_balance)
