@@ -26,7 +26,7 @@ FIRST_TICK_ANTI_DUMP_LIMIT = 10.0
 STORAGE_CAPACITY = 120.0
 MAX_CHARGE = 15.0
 MAX_DISCHARGE = 20.0
-BASE_RESERVE = 20.0
+BASE_RESERVE_PER_STORAGE = 20.0
 
 # Управление окнами прогноза
 GENERAL_LOOKAHEAD = 8
@@ -34,9 +34,9 @@ NIGHT_POST_TAIL = 3
 FINAL_WINDOW_MIN = 10
 
 # Пороги предзаряда
-DEFAULT_TARGET_CHARGE = 20.0
-NIGHT_TARGET_CHARGE = 80.0
-STRONG_NIGHT_TARGET_CHARGE = 100.0
+DEFAULT_TARGET_CHARGE_PER_STORAGE = 20.0
+NIGHT_TARGET_CHARGE_PER_STORAGE = 80.0
+STRONG_NIGHT_TARGET_CHARGE_PER_STORAGE = 100.0
 LATE_GAME_NIGHT_TARGET_CAP = 60.0
 
 # Пороговые сигналы генерации и ветра
@@ -104,7 +104,7 @@ def order_amount(value):
 def apply_charge(storages, amount_limit):
     remaining = max(0.0, amount_limit)
     charged = 0.0
-    for storage in sorted(storages, key=lambda x: x["charge"] + x["planned_charge"]):
+    for storage in sorted(storages, key=lambda x: x["charge"] + x["planned_charge"] - x["planned_discharge"]):
         if remaining <= EPS:
             break
         soc = storage["charge"] + storage["planned_charge"] - storage["planned_discharge"]
@@ -216,6 +216,8 @@ solar_count = count_solar
 wind_count = count_wind
 has_solar = count_solar > 0
 has_wind = count_wind > 0
+storage_count = count_storage
+total_storage_capacity = storage_count * STORAGE_CAPACITY
 
 safe_energy_raw = current_generation - current_consumption
 safe_energy = max(0.0, safe_energy_raw)
@@ -297,7 +299,9 @@ if next_night_start is not None and next_night_end is not None:
         future_night_load_avg = sum(night_load_values) / len(night_load_values)
         future_night_load_max = max(night_load_values)
 
-ticks_to_fill = math.ceil(max(0.0, NIGHT_TARGET_CHARGE - total_storage_charge) / MAX_CHARGE)
+night_target_charge = storage_count * NIGHT_TARGET_CHARGE_PER_STORAGE
+total_charge_rate = max(MAX_CHARGE, storage_count * MAX_CHARGE)
+ticks_to_fill = math.ceil(max(0.0, night_target_charge - total_storage_charge) / total_charge_rate) if storage_count > 0 else 0
 precharge_horizon = min(GENERAL_LOOKAHEAD, ticks_to_fill + 1)
 
 night_risk = (
@@ -335,17 +339,20 @@ absolute_bad_weather = (
 future_load_risk = max_future_load > current_generation
 obvious_deficit = future_load_risk and (sun_drop or wind_drop or absolute_bad_weather)
 
-target_charge = DEFAULT_TARGET_CHARGE
+default_target_charge = storage_count * DEFAULT_TARGET_CHARGE_PER_STORAGE
+strong_night_target_charge = storage_count * STRONG_NIGHT_TARGET_CHARGE_PER_STORAGE
+
+target_charge = default_target_charge
 if night_risk:
-    target_charge = NIGHT_TARGET_CHARGE
+    target_charge = night_target_charge
 if night_risk_strong:
-    target_charge = STRONG_NIGHT_TARGET_CHARGE
+    target_charge = strong_night_target_charge
 if obvious_deficit:
-    target_charge = max(target_charge, NIGHT_TARGET_CHARGE)
+    target_charge = max(target_charge, night_target_charge)
 if next_night_start is not None and next_night_start >= LATE_GAME_NIGHT_START_TICK:
-    target_charge = min(target_charge, LATE_GAME_NIGHT_TARGET_CAP)
-if count_storage > 0:
-    target_charge = min(target_charge, STORAGE_CAPACITY * count_storage)
+    target_charge = min(target_charge, storage_count * LATE_GAME_NIGHT_TARGET_CAP)
+if storage_count > 0:
+    target_charge = min(target_charge, total_storage_capacity)
 else:
     target_charge = 0.0
 
@@ -370,7 +377,7 @@ if safe_energy_raw < 0.0:
     if in_final_window:
         discharged_total += apply_discharge(storage_objects, deficit, 0.0, True)
     else:
-        discharged_primary = apply_discharge(storage_objects, deficit, BASE_RESERVE, False)
+        discharged_primary = apply_discharge(storage_objects, deficit, BASE_RESERVE_PER_STORAGE, False)
         discharged_total += discharged_primary
         remaining_deficit = max(0.0, deficit - discharged_primary)
         if remaining_deficit > EPS:
