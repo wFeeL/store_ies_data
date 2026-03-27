@@ -156,7 +156,11 @@ if useful_balance < 0.0:
     deficit = -useful_balance
     discharged_total = apply_discharge(storage_objects, deficit)
     post_balance = useful_balance + discharged_total
-    sell_amount = max(0.0, post_balance)
+
+    # В дефиците на рынок не продаем: любой остаток направляем в накопители.
+    if storage_count > 0 and post_balance > EPS:
+        charged_total += apply_charge(storage_objects, post_balance)
+    sell_amount = 0.0
     sell_price = DEFICIT_MODE_SELL_PRICE
 else:
     # Профицит: сначала заряжаем накопители, остаток продаем.
