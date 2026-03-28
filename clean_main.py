@@ -37,10 +37,11 @@ def normalize_storage_id(raw_id):
 def storage_order_id(obj):
     address = getattr(obj, "address", None)
     if isinstance(address, (list, tuple)) and address:
-        addr0 = str(address[0])
+        addr0 = str(address[0]).strip()
         if addr0:
             return addr0
-    return normalize_storage_id(getattr(obj, "id", ""))
+    raw_id = normalize_storage_id(getattr(obj, "id", ""))
+    return str(raw_id).strip()
 
 
 def order_amount(value):
@@ -49,22 +50,31 @@ def order_amount(value):
     return math.floor(clipped * scale + FLOOR_EPS) / scale
 
 
+def get_api_objects(psm):
+    objects = getattr(psm, "objects", [])
+    if isinstance(objects, (list, tuple)):
+        return objects
+    return []
+
+
 def collect_storage_objects(psm):
     storages = []
-    for obj in getattr(psm, "objects", []):
+    for obj in get_api_objects(psm):
         if str(getattr(obj, "type", "")).strip().lower() != "storage":
             continue
         if to_float(getattr(obj, "failed", 0), 0.0) > 0.0:
             continue
 
-        charge_raw = getattr(getattr(obj, "charge", None), "now", None)
-        if charge_raw is None:
+        storage_id = storage_order_id(obj)
+        if not storage_id:
             continue
+
+        charge_raw = getattr(getattr(obj, "charge", None), "now", None)
         charge_now = max(0.0, to_float(charge_raw, 0.0))
 
         storages.append(
             {
-                "id": storage_order_id(obj),
+                "id": storage_id,
                 "charge": charge_now,
                 "planned_discharge": 0.0,
             }
